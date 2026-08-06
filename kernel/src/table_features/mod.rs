@@ -829,6 +829,23 @@ pub(crate) fn extract_enabled_reader_features(protocol: &Protocol) -> Vec<TableF
     }
 }
 
+/// Extract the writer features enabled for `protocol`. For `min_writer_version == 7` returns the
+/// explicit `writer_features` list; for `1..=6` returns the legacy-inferred features.
+pub(crate) fn extract_enabled_writer_features(protocol: &Protocol) -> Vec<TableFeature> {
+    match protocol.min_writer_version() {
+        TABLE_FEATURES_MIN_WRITER_VERSION => protocol
+            .writer_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default(),
+        v if (1..=6).contains(&v) => LEGACY_WRITER_FEATURES
+            .iter()
+            .filter(|f| f.is_valid_for_legacy_writer(v))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Add `feature` to the appropriate feature list(s) for its type, skipping duplicates.
 pub(crate) fn add_feature_to_lists(
     feature: TableFeature,
@@ -850,6 +867,64 @@ pub(crate) fn add_feature_to_lists(
             }
         }
     }
+}
+
+/// Construct a modern protocol that preserves all current explicit or legacy-implied features
+/// and adds the requested features. Currently only [`TableFeature::V2Checkpoint`] can be added.
+pub(crate) fn protocol_with_added_features(
+    protocol: &Protocol,
+    requested_features: impl IntoIterator<Item = TableFeature>,
+    allow_protocol_versions_increase: bool,
+) -> DeltaResult<Protocol> {
+    let requested_features: Vec<_> = requested_features.into_iter().collect();
+    require!(
+        !requested_features.is_empty(),
+        Error::invalid_protocol("At least one table feature must be requested")
+    );
+    require!(
+        requested_features
+            .iter()
+            .all(|feature| feature == &TableFeature::V2Checkpoint),
+        Error::invalid_protocol("Only the v2Checkpoint table feature can be added")
+    );
+    require!(
+        protocol.min_reader_version() <= TABLE_FEATURES_MIN_READER_VERSION
+            && protocol.min_writer_version() <= TABLE_FEATURES_MIN_WRITER_VERSION,
+        Error::invalid_protocol(
+            "Adding table features must not lower the current protocol versions"
+        )
+    );
+
+    let versions_are_modern = protocol.min_reader_version() == TABLE_FEATURES_MIN_READER_VERSION
+        && protocol.min_writer_version() == TABLE_FEATURES_MIN_WRITER_VERSION;
+    require!(
+        allow_protocol_versions_increase || versions_are_modern,
+        Error::invalid_protocol(
+            "Adding table features requires increasing the protocol versions; set allow_protocol_versions_increase to true"
+        )
+    );
+
+    let mut reader_features = Vec::new();
+    let mut writer_features = Vec::new();
+
+    // An explicit reader feature might be unknown to this kernel. Preserve it in both lists
+    // because reader features are necessarily also writer features.
+    for feature in extract_enabled_reader_features(protocol) {
+        if !reader_features.contains(&feature) {
+            reader_features.push(feature.clone());
+        }
+        if !writer_features.contains(&feature) {
+            writer_features.push(feature);
+        }
+    }
+    for feature in extract_enabled_writer_features(protocol) {
+        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+    }
+    for feature in requested_features {
+        add_feature_to_lists(feature, &mut reader_features, &mut writer_features);
+    }
+
+    Protocol::try_new_modern(reader_features, writer_features)
 }
 
 /// Enable each `allowed_table_features` entry whose [`EnablementCheck::EnabledIf`] check is
@@ -926,6 +1001,198 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    fn assert_feature_lists(
+        protocol: &Protocol,
+        expected_reader: &[TableFeature],
+        expected_writer: &[TableFeature],
+    ) {
+        assert_eq!(
+            protocol.min_reader_version(),
+            TABLE_FEATURES_MIN_READER_VERSION
+        );
+        assert_eq!(
+            protocol.min_writer_version(),
+            TABLE_FEATURES_MIN_WRITER_VERSION
+        );
+        assert_eq!(protocol.reader_features().unwrap(), expected_reader);
+        assert_eq!(protocol.writer_features().unwrap(), expected_writer);
+    }
+
+    #[rstest]
+    #[case::versions_1_1(
+        1,
+        1,
+        vec![TableFeature::V2Checkpoint],
+        vec![TableFeature::V2Checkpoint]
+    )]
+    #[case::writer_2(
+        1,
+        2,
+        vec![TableFeature::V2Checkpoint],
+        vec![
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::V2Checkpoint,
+        ]
+    )]
+    #[case::writer_3(
+        1,
+        3,
+        vec![TableFeature::V2Checkpoint],
+        vec![
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::V2Checkpoint,
+        ]
+    )]
+    #[case::writer_4(
+        1,
+        4,
+        vec![TableFeature::V2Checkpoint],
+        vec![
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::ChangeDataFeed,
+            TableFeature::GeneratedColumns,
+            TableFeature::V2Checkpoint,
+        ]
+    )]
+    #[case::reader_2_writer_5(
+        2,
+        5,
+        vec![TableFeature::ColumnMapping, TableFeature::V2Checkpoint],
+        vec![
+            TableFeature::ColumnMapping,
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::ChangeDataFeed,
+            TableFeature::GeneratedColumns,
+            TableFeature::V2Checkpoint,
+        ]
+    )]
+    #[case::writer_5(
+        1,
+        5,
+        vec![TableFeature::ColumnMapping, TableFeature::V2Checkpoint],
+        vec![
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::ChangeDataFeed,
+            TableFeature::GeneratedColumns,
+            TableFeature::ColumnMapping,
+            TableFeature::V2Checkpoint,
+        ]
+    )]
+    #[case::reader_2_writer_6(
+        2,
+        6,
+        vec![TableFeature::ColumnMapping, TableFeature::V2Checkpoint],
+        vec![
+            TableFeature::ColumnMapping,
+            TableFeature::AppendOnly,
+            TableFeature::Invariants,
+            TableFeature::CheckConstraints,
+            TableFeature::ChangeDataFeed,
+            TableFeature::GeneratedColumns,
+            TableFeature::IdentityColumns,
+            TableFeature::V2Checkpoint,
+        ]
+    )]
+    fn protocol_promotion_preserves_legacy_implied_features(
+        #[case] reader_version: i32,
+        #[case] writer_version: i32,
+        #[case] expected_reader: Vec<TableFeature>,
+        #[case] expected_writer: Vec<TableFeature>,
+    ) {
+        let protocol = Protocol::try_new_legacy(reader_version, writer_version).unwrap();
+        let promoted =
+            protocol_with_added_features(&protocol, [TableFeature::V2Checkpoint], true).unwrap();
+
+        assert_feature_lists(&promoted, &expected_reader, &expected_writer);
+    }
+
+    #[test]
+    fn protocol_promotion_preserves_modern_features_and_deduplicates_v2_checkpoint() {
+        let unknown_reader = TableFeature::unknown("futureReaderWriter");
+        let unknown_writer = TableFeature::unknown("futureWriterOnly");
+        let protocol = Protocol::try_new_modern(
+            [
+                TableFeature::DeletionVectors,
+                unknown_reader.clone(),
+                TableFeature::V2Checkpoint,
+            ],
+            [
+                TableFeature::DeletionVectors,
+                unknown_reader.clone(),
+                TableFeature::AppendOnly,
+                unknown_writer.clone(),
+                TableFeature::V2Checkpoint,
+            ],
+        )
+        .unwrap();
+
+        let promoted = protocol_with_added_features(
+            &protocol,
+            [TableFeature::V2Checkpoint, TableFeature::V2Checkpoint],
+            false,
+        )
+        .unwrap();
+
+        assert_feature_lists(
+            &promoted,
+            &[
+                TableFeature::DeletionVectors,
+                unknown_reader.clone(),
+                TableFeature::V2Checkpoint,
+            ],
+            &[
+                TableFeature::DeletionVectors,
+                unknown_reader,
+                TableFeature::V2Checkpoint,
+                TableFeature::AppendOnly,
+                unknown_writer,
+            ],
+        );
+    }
+
+    #[test]
+    fn protocol_promotion_rejects_required_version_increase_without_permission() {
+        let protocol = Protocol::try_new_legacy(1, 2).unwrap();
+        let result = protocol_with_added_features(&protocol, [TableFeature::V2Checkpoint], false);
+
+        assert!(
+            matches!(result, Err(Error::InvalidProtocol(message)) if message.contains("allow_protocol_versions_increase"))
+        );
+    }
+
+    #[test]
+    fn protocol_promotion_rejects_empty_or_unsupported_requests() {
+        let protocol =
+            Protocol::try_new_modern(Vec::<TableFeature>::new(), Vec::<TableFeature>::new())
+                .unwrap();
+
+        let empty = protocol_with_added_features(&protocol, [], false);
+        assert!(matches!(empty, Err(Error::InvalidProtocol(_))));
+
+        let unsupported =
+            protocol_with_added_features(&protocol, [TableFeature::DeletionVectors], false);
+        assert!(matches!(unsupported, Err(Error::InvalidProtocol(_))));
+    }
+
+    #[test]
+    fn protocol_promotion_rejects_protocol_version_downgrade() {
+        let protocol = Protocol::try_new_legacy(1, 8).unwrap();
+        let result = protocol_with_added_features(&protocol, [TableFeature::V2Checkpoint], true);
+
+        assert!(
+            matches!(result, Err(Error::InvalidProtocol(message)) if message.contains("must not lower"))
+        );
+    }
 
     #[test]
     fn test_unknown_features() {

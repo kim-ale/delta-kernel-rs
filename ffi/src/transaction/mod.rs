@@ -1,6 +1,7 @@
 //! This module holds functionality for managing transactions.
 mod deletion_vector;
 mod partition_value;
+mod table_features;
 mod transaction_id;
 mod write_context;
 
@@ -29,6 +30,7 @@ pub use partition_value::{
     partition_value_map_insert_timestamp, partition_value_map_insert_timestamp_ntz,
     partition_value_map_new, ExclusivePartitionValueMap,
 };
+pub use table_features::{add_table_features, FfiCommitInfoEntry};
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -129,7 +131,7 @@ fn transaction_with_committer_impl(
 /// [`free_committed_transaction`].
 ///
 /// TODO: expose the full `CommitResult` enum through FFI for conflict resolution.
-fn commit_result_to_committed_handle<S>(
+pub(super) fn commit_result_to_committed_handle<S>(
     result: DeltaResult<CommitResult<S>>,
 ) -> DeltaResult<Handle<ExclusiveCommittedTransaction>> {
     match result? {

@@ -80,8 +80,8 @@ fn add_table_features_impl(
     })?;
     let builder = snapshot
         .alter_table()
-        .with_allow_protocol_versions_increase(allow_protocol_versions_increase)
-        .add_table_feature(first_feature);
+        .add_table_feature(first_feature)
+        .with_allow_protocol_versions_increase(allow_protocol_versions_increase);
     let builder = features.fold(builder, |builder, feature| {
         builder.add_table_feature(feature)
     });

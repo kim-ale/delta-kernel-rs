@@ -1,6 +1,53 @@
-# delta-kernel-rs ffi
+---
+title: Delta Kernel Rust FFI
+description: C and C++ interfaces, build instructions, and caller ownership contracts.
+---
 
 This crate provides a C foreign function interface (ffi) for delta-kernel-rs.
+
+## Azure Credential Providers
+
+Default-engine builds support on-demand Azure bearer acquisition through
+`create_azure_credential_provider` and `builder_with_azure_credential_provider`.
+The provider is attached before normal Azure store construction. Later requests
+use renewed credentials through the same engine and store; credential renewal
+does not rebuild snapshots. Without a provider, existing construction is unchanged.
+
+`CAzureCredentialProviderConfig` version 1 requires its exact generated structure
+size, Start and Release callbacks, and explicit limits. Acquisition timeout is
+1-120000 milliseconds, minimum remaining token lifetime 1-3600000 milliseconds,
+token size 1-65536 bytes, and outstanding tickets 1-1024. Native waiters are capped
+at 1024. Timed-out foreign tickets retain capacity until completed, failed or freed.
+
+Start receives a numeric request ID and one exclusive request ticket. Queue foreign
+acquisition and return promptly. Complete, fail or free that ticket exactly once;
+those calls consume it even on error. Completion copies borrowed token bytes during
+the call and requires the actual absolute UTC expiry in Unix milliseconds. Never
+derive expiry from token text. A false result means retired, not reusable.
+
+Cancel is optional and cooperative. It receives the request ID after Start returns
+and never owns the ticket. Release runs once after all provider, builder, store,
+request and active callback ownership ends. All callbacks must be nonblocking,
+nonthrowing, any-thread-safe and safe for concurrent calls. Native timeout cannot
+reclaim a ticket that foreign code still owns or forcibly terminate application work.
+
+The builder setter unconditionally consumes its builder and borrows the provider
+handle, retaining its own reference. Replace the builder with the returned handle;
+never reuse the input, including on failure. Freeing the caller's provider reference
+does not invalidate a builder, engine or admitted request that retains it. Error
+allocators copy their borrowed message and return caller-owned error storage.
+
+Provider mode rejects non-Azure backends, custom URL handlers, REST attachment,
+competing authentication options and enabled emulator/unsigned-request modes.
+Acquisition errors do not fall back to ambient credentials or replay mutations.
+There is no automatic retry or proactive idle acquisition. A subsequent operation
+can retry a failed acquisition; failure kinds distinguish transient, permanent and
+cancelled results without copying foreign exception text.
+
+The [C consumer](examples/azure-credentials/README.md) demonstrates owned handles,
+queued completion and cleanup using the generated header. Its environment-token
+step is a static demonstration, not an OAuth refresh implementation. Applications
+must supply an identity SDK returning a real token and its real expiry.
 
 ## Building
 

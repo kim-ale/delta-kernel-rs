@@ -50,6 +50,8 @@ extern crate self as delta_kernel_ffi;
 
 mod alloc_stats;
 
+#[cfg(feature = "default-engine-base")]
+pub mod azure_credentials;
 pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
@@ -82,6 +84,10 @@ pub mod schema;
 pub mod schema_visitor;
 pub mod snapshot_hint;
 
+#[cfg(all(test, feature = "default-engine-base"))]
+mod azure_credential_integration;
+#[cfg(all(test, feature = "default-engine-base", not(miri)))]
+mod credential_provider_u0;
 #[cfg(test)]
 mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
@@ -809,6 +815,7 @@ pub(crate) enum ObjectStoreBackend {
     /// `url` and [`builder_with_option`] keys are passed to [`store_from_url_opts`].
     #[default]
     UrlScheme,
+    UrlAzure(Arc<azure_credentials::AzureCredentialProvider>),
     /// REST file API; configured via [`builder_with_rest_object_store`].
     Rest(Box<rest_engine::RestBuilderState>),
 }
@@ -1043,6 +1050,14 @@ fn builder_with_rest_object_store_impl(
     callback: Option<rest_engine::CAuthHeaderCallback>,
     context: NullableCvoid,
 ) -> Result<()> {
+    if matches!(
+        builder.object_store_backend,
+        ObjectStoreBackend::UrlAzure(_)
+    ) {
+        return Err(delta_kernel::KernelError::generic(
+            "REST storage conflicts with an Azure credential provider",
+        ));
+    }
     // SAFETY: caller guarantees a non-null, valid `endpoint_config` for the duration of the call.
     let endpoint_config = unsafe { endpoint_config.as_ref() }
         .ok_or_else(|| delta_kernel::KernelError::generic("null CRestEndpointConfig pointer"))?;
@@ -1054,6 +1069,40 @@ fn builder_with_rest_object_store_impl(
             builder.allocate_fn,
         )?));
     Ok(())
+}
+
+/// Attach an on-demand Azure bearer provider to normal URL-backed engine construction.
+///
+/// The provider is retained by the builder and resulting store. No acquisition starts here.
+/// Build rejects non-Azure URLs, custom handlers and conflicting authentication options.
+///
+/// # Errors
+///
+/// Returns an error for a REST-backed builder. On error the consumed builder is dropped.
+///
+/// # Safety
+///
+/// `builder` is valid and unconditionally consumed, including on error. `provider` borrows a
+/// valid shared handle for this call; its caller-owned reference is not consumed. Replace the
+/// builder with the returned handle on success and never reuse the input builder.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn builder_with_azure_credential_provider(
+    builder: Handle<ExclusiveEngineBuilder>,
+    provider: &Handle<azure_credentials::SharedAzureCredentialProvider>,
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let allocate_fn = builder.allocate_fn;
+    let result = if matches!(builder.object_store_backend, ObjectStoreBackend::Rest(_)) {
+        Err(delta_kernel::KernelError::generic(
+            "Azure credential provider conflicts with REST storage",
+        ))
+    } else {
+        builder.object_store_backend =
+            ObjectStoreBackend::UrlAzure(unsafe { provider.clone_as_arc() });
+        Ok(builder.into())
+    };
+    unsafe { result.into_extern_result(&allocate_fn) }
 }
 
 /// Consume the builder and return a default engine. The builder is consumed regardless of the
@@ -1138,10 +1187,15 @@ fn get_default_engine_impl(
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> Result<Handle<SharedExternEngine>> {
-    use delta_kernel_default_engine::storage::store_from_url_opts;
+    use delta_kernel_default_engine::storage::{
+        store_from_url_opts, store_from_url_opts_with_azure_credentials,
+    };
 
     let store = match object_store_backend {
         ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
+        ObjectStoreBackend::UrlAzure(provider) => {
+            store_from_url_opts_with_azure_credentials(&url, options, Some(provider))?
+        }
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }

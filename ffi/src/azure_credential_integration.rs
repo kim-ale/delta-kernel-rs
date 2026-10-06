@@ -472,13 +472,209 @@ fn provider_replacement_releases_old_reference_and_retains_new_reference() {
 }
 
 #[rstest]
-#[case::non_azure("memory:///", None, "require an Azure storage URL")]
-#[case::competing_auth(TABLE_URL, Some(("bearer_token", "private-test-token")), "conflicts with")]
-#[case::unsigned(TABLE_URL, Some(("skip_signature", "true")), "to be false")]
-#[case::emulator(TABLE_URL, Some(("use_emulator", "true")), "to be false")]
+#[cfg_attr(
+    miri,
+    ignore = "HTTP/Tokio; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder"
+)]
+fn custom_provider_overrides_static_options_without_failure_fallback(
+    #[values(CallbackOutcome::Complete, CallbackOutcome::Fail)] outcome: CallbackOutcome,
+) {
+    let runtime = http_runtime();
+    let server = runtime.block_on(MockServer::start());
+    runtime.block_on(
+        Mock::given(method("HEAD"))
+            .and(path("/prefix/container/table/blob"))
+            .and(header("authorization", "Bearer token-A"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"data".to_vec())
+                    .insert_header("etag", "\"provider-etag\"")
+                    .insert_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            )
+            .mount(&server),
+    );
+    let counts = Arc::new(CallbackCounts::default());
+    let provider = create_provider_with_outcome(&counts, outcome);
+    let mut builder = with_provider(engine_builder(TABLE_URL), &provider);
+    unsafe { free_azure_credential_provider(provider) };
+    for (key, value) in [
+        ("bearer_token", "unused-static-token"),
+        ("access_key", "unused-invalid-key"),
+        ("use_azure_cli", "false"),
+        ("credential_type", "unused-selector"),
+        ("allow_http", "true"),
+        ("azure_timeout", "2s"),
+    ] {
+        builder = with_option(builder, key, value);
+    }
+    builder = with_option(
+        builder,
+        "azure_endpoint",
+        &format!("{}/prefix", server.uri()),
+    );
+    let engine = ok_or_panic(unsafe { builder_build(builder) });
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    let file = Url::parse(TABLE_URL).unwrap().join("blob").unwrap();
+    let result = kernel_engine.storage_handler().head(&file);
+    let requests = runtime.block_on(server.received_requests()).unwrap();
+    if matches!(outcome, CallbackOutcome::Complete) {
+        assert_eq!(result.unwrap().size, 4);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers["authorization"], "Bearer token-A");
+    } else {
+        assert!(result.unwrap_err().to_string().contains("transient"));
+        assert!(requests.is_empty());
+    }
+    assert_counts(&counts, 1, 0);
+    drop(kernel_engine);
+    unsafe { free_engine(engine) };
+    assert_counts(&counts, 1, 1);
+}
+
+#[rstest]
+#[cfg_attr(
+    miri,
+    ignore = "HTTP/Tokio; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder, tests::test_setting_multithread_executor"
+)]
+fn unsigned_requests_skip_credential_callback(#[values(false, true)] multithreaded: bool) {
+    let runtime = http_runtime();
+    let server = runtime.block_on(MockServer::start());
+    runtime.block_on(
+        Mock::given(method("HEAD"))
+            .and(path("/prefix/container/table/blob"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"data".to_vec())
+                    .insert_header("etag", "\"unsigned-etag\"")
+                    .insert_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+            )
+            .expect(1)
+            .mount(&server),
+    );
+    let counts = Arc::new(CallbackCounts::default());
+    let provider = create_provider_with_outcome(&counts, CallbackOutcome::Fail);
+    let mut builder = with_provider(engine_builder(TABLE_URL), &provider);
+    unsafe { free_azure_credential_provider(provider) };
+    builder = with_option(
+        builder,
+        "azure_endpoint",
+        &format!("{}/prefix", server.uri()),
+    );
+    builder = with_option(builder, "allow_http", "true");
+    builder = with_option(builder, "skip_signature", "true");
+    builder = with_option(builder, "azure_timeout", "2s");
+    if multithreaded {
+        builder = unsafe { builder_with_multithreaded_executor(builder, 2, 2) };
+    }
+    let engine = ok_or_panic(unsafe { builder_build(builder) });
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    let file = Url::parse(TABLE_URL).unwrap().join("blob").unwrap();
+    assert_eq!(kernel_engine.storage_handler().head(&file).unwrap().size, 4);
+    let requests = runtime.block_on(server.received_requests()).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert_counts(&counts, 0, 0);
+    runtime.block_on(server.verify());
+    drop(kernel_engine);
+    unsafe { free_engine(engine) };
+    assert_counts(&counts, 0, 1);
+}
+
+#[rstest]
+#[cfg_attr(
+    miri,
+    ignore = "Safe Azure client/executor construction; unsafe covered by caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder, tests::test_setting_multithread_executor"
+)]
+fn emulator_construction_releases_unused_custom_provider(
+    #[values(false, true)] multithreaded: bool,
+) {
+    let counts = Arc::new(CallbackCounts::default());
+    let provider = create_provider_with_outcome(&counts, CallbackOutcome::Fail);
+    let mut builder = with_provider(engine_builder(TABLE_URL), &provider);
+    unsafe { free_azure_credential_provider(provider) };
+    assert_counts(&counts, 0, 0);
+    builder = with_option(builder, "use_emulator", "true");
+    builder = with_option(builder, "bearer_token", "emulator-static-token");
+    if multithreaded {
+        builder = unsafe { builder_with_multithreaded_executor(builder, 2, 2) };
+    }
+    let engine = ok_or_panic(unsafe { builder_build(builder) });
+    assert_counts(&counts, 0, 1);
+    unsafe { free_engine(engine) };
+    assert_counts(&counts, 0, 1);
+}
+
+#[rstest]
+#[ignore = "Requires local Azurite and AZURITE_BLOB_STORAGE_URL; unsafe covered by caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder"]
+fn azurite_emulator_roundtrip_bypasses_custom_provider(#[values(false, true)] multithreaded: bool) {
+    let endpoint = std::env::var("AZURITE_BLOB_STORAGE_URL")
+        .expect("set AZURITE_BLOB_STORAGE_URL to an isolated local Azurite endpoint");
+    let endpoint = Url::parse(&endpoint).unwrap();
+    assert_eq!(endpoint.scheme(), "http");
+    assert!(matches!(endpoint.host_str(), Some("127.0.0.1" | "[::1]")));
+    assert!(endpoint.port().is_some());
+    assert!(endpoint.username().is_empty());
+    assert!(endpoint.password().is_none());
+    assert_eq!(endpoint.path(), "/");
+    assert!(endpoint.query().is_none());
+    assert!(endpoint.fragment().is_none());
+
+    let table_url = "az://delta-kernel-ffi-smoke/table/";
+    let counts = Arc::new(CallbackCounts::default());
+    let provider = create_provider_with_outcome(&counts, CallbackOutcome::Fail);
+    let mut builder = with_provider(engine_builder(table_url), &provider);
+    unsafe { free_azure_credential_provider(provider) };
+    assert_counts(&counts, 0, 0);
+    builder = with_option(builder, "use_emulator", "true");
+    builder = with_option(builder, "azure_timeout", "5s");
+    if multithreaded {
+        builder = unsafe { builder_with_multithreaded_executor(builder, 2, 2) };
+    }
+    let engine = ok_or_panic(unsafe { builder_build(builder) });
+    assert_counts(&counts, 0, 1);
+    let kernel_engine = unsafe { engine.as_ref() }.engine();
+    let file = Url::parse(table_url)
+        .unwrap()
+        .join(&format!("smoke-{}.bin", rand::random::<u64>()))
+        .unwrap();
+    let storage = kernel_engine.storage_handler();
+    let result = (|| -> delta_kernel::Result<()> {
+        for (data, overwrite) in [
+            (Bytes::from_static(b"azurite-first"), false),
+            (Bytes::from_static(b"azurite-overwritten"), true),
+        ] {
+            storage.put(&file, data.clone(), overwrite)?;
+            let metadata = storage.head(&file)?;
+            assert_eq!(metadata.location, file);
+            assert_eq!(metadata.size, data.len() as u64);
+            let read: Vec<_> = storage
+                .read_files(vec![(file.clone(), None)])?
+                .collect::<delta_kernel::Result<_>>()?;
+            assert_eq!(read, vec![data]);
+        }
+        Ok(())
+    })();
+    let cleanup = storage.delete(&file);
+    drop(kernel_engine);
+    unsafe { free_engine(engine) };
+    assert_counts(&counts, 0, 1);
+    result.unwrap();
+    cleanup.unwrap();
+}
+
+#[rstest]
+#[case::non_azure(
+    "memory:///",
+    None,
+    FFIKernelError::GenericError,
+    "require an Azure storage URL"
+)]
+#[case::invalid_unsigned_option(TABLE_URL, Some(("skip_signature", "not-a-boolean")), FFIKernelError::ObjectStoreError, "failed to parse")]
+#[case::invalid_emulator_option(TABLE_URL, Some(("use_emulator", "not-a-boolean")), FFIKernelError::ObjectStoreError, "failed to parse")]
 fn rejected_build_consumes_builder_and_releases_provider_without_acquisition(
     #[case] url: &str,
     #[case] option: Option<(&str, &str)>,
+    #[case] expected_error_kind: FFIKernelError,
     #[case] expected_error: &str,
 ) {
     let counts = Arc::new(CallbackCounts::default());
@@ -491,7 +687,7 @@ fn rejected_build_consumes_builder_and_releases_provider_without_acquisition(
     assert_counts(&counts, 0, 0);
     assert_extern_result_error_contains(
         unsafe { builder_build(builder) },
-        FFIKernelError::GenericError,
+        expected_error_kind,
         expected_error,
     );
     assert_counts(&counts, 0, 1);

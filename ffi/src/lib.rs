@@ -1073,9 +1073,13 @@ fn builder_with_rest_object_store_impl(
 
 /// Attach an on-demand Azure bearer provider to normal URL-backed engine construction.
 ///
-/// The provider is retained by the builder and resulting store. No acquisition starts here.
-/// Provider mode selects the built-in Azure backend, not custom URL handlers. Build rejects
-/// non-Azure URLs and conflicting authentication options.
+/// The builder retains the provider; the resulting store retains it when selected by the native
+/// Azure builder. No acquisition starts here. Provider mode selects the built-in Azure backend,
+/// not custom URL handlers, and rejects non-Azure URLs. Recognized configuration options follow
+/// native Azure builder behavior: normal credential resolution prefers the custom provider over
+/// static or built-in credentials, `use_emulator=true` selects emulator credentials instead, and
+/// `skip_signature=true` omits authentication and acquisition. Attaching a provider enables neither
+/// option.
 ///
 /// # Errors
 ///

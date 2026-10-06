@@ -24,33 +24,6 @@ pub(crate) fn build(
         let Ok(key) = key.to_ascii_lowercase().parse::<AzureConfigKey>() else {
             continue;
         };
-        match key {
-            AzureConfigKey::AccountName
-            | AzureConfigKey::ContainerName
-            | AzureConfigKey::Endpoint
-            | AzureConfigKey::UseFabricEndpoint
-            | AzureConfigKey::DisableTagging
-            | AzureConfigKey::Client(_) => {}
-            #[cfg(feature = "arrow-60")]
-            AzureConfigKey::EncryptionKey => {}
-            AzureConfigKey::UseEmulator | AzureConfigKey::SkipSignature => {
-                if !matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no" | "n"
-                ) {
-                    return Err(KernelError::generic(format!(
-                        "Azure credential provider requires {} to be false",
-                        key.as_ref()
-                    )));
-                }
-            }
-            _ => {
-                return Err(KernelError::generic(format!(
-                    "Azure credential provider conflicts with {}",
-                    key.as_ref()
-                )));
-            }
-        }
         builder = builder.with_config(key, value);
     }
     Ok(Arc::new(builder.with_credentials(provider).build()?))
@@ -124,42 +97,76 @@ mod tests {
     }
 
     #[rstest]
-    fn recognized_auth_options_conflict_without_exposing_values(
-        #[values(
-            "AZURE_STORAGE_ACCOUNT_KEY",
-            "SaS_ToKeN",
-            "bearer_token",
-            "Azure_Client_Secret",
-            "azure_msi_endpoint",
-            "azure_use_azure_cli"
-        )]
-        key: &str,
-    ) {
-        let error = build_store("az://container/table/", &[(key, SECRET)]).unwrap_err();
-        assert!(error.to_string().contains("conflicts with"));
-        assert!(!error.to_string().contains(SECRET));
-    }
-
-    #[rstest]
-    #[case("use_emulator", "true", false)]
-    #[case("AZURE_STORAGE_USE_EMULATOR", "FALSE", true)]
-    #[case("skip_signature", SECRET, false)]
-    #[case("AZURE_SKIP_SIGNATURE", "off", true)]
+    #[case("AZURE_STORAGE_ACCOUNT_KEY", SECRET)]
+    #[case("SaS_ToKeN", SECRET)]
+    #[case("bearer_token", SECRET)]
+    #[case("Azure_Client_Secret", SECRET)]
+    #[case("azure_client_id", "unused-client")]
+    #[case("azure_tenant_id", "unused-tenant")]
+    #[case("authority_host", "unused-not-a-url")]
+    #[case("azure_msi_endpoint", "unused-not-a-url")]
+    #[case("object_id", "unused-id")]
+    #[case("federated_token_file", "unused-nonexistent-file")]
+    #[case("azure_use_azure_cli", "false")]
+    #[case("azure_use_azure_cli", "unused-invalid-boolean")]
+    #[case("fabric_token_service_url", "unused-not-a-url")]
+    #[case("AZURE_CREDENTIAL_TYPE", "auto")]
+    #[case("credential_type", "unused-invalid-selector")]
     #[cfg_attr(
         miri,
         ignore = "Safe Azure client construction; no unsafe FFI exercised"
     )]
-    fn auth_bypass_options_require_false(
-        #[case] key: &str,
-        #[case] value: &str,
-        #[case] accepted: bool,
-    ) {
-        let result = build_store("az://container/table/", &[(key, value)]);
-        assert_eq!(result.is_ok(), accepted);
-        if let Err(error) = result {
-            assert!(error.to_string().contains("to be false"));
-            assert!(!error.to_string().contains(value));
+    fn custom_provider_options_match_native_precedence(#[case] key: &str, #[case] value: &str) {
+        let url = "az://container/table/";
+        let mut native = MicrosoftAzureBuilder::new()
+            .with_url(url)
+            .with_config(AzureConfigKey::AccountName, "configured");
+        if let Ok(key) = key.to_ascii_lowercase().parse::<AzureConfigKey>() {
+            native = native.with_config(key, value);
         }
+        let provider = Arc::new(TestProvider::default());
+        let native = native.with_credentials(provider.clone()).build();
+        let ffi = build_store(url, &[(key, value)]);
+        assert!(
+            native.is_ok(),
+            "native custom-provider construction must accept {key}"
+        );
+        assert_eq!(ffi.is_ok(), native.is_ok());
+        assert_eq!(ffi.unwrap().to_string(), native.unwrap().to_string());
+        assert_eq!(provider.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    #[case("use_emulator", "true")]
+    #[case("AZURE_STORAGE_USE_EMULATOR", "FALSE")]
+    #[case("use_emulator", "on")]
+    #[case("use_emulator", "not-a-boolean")]
+    #[case("skip_signature", "true")]
+    #[case("AZURE_SKIP_SIGNATURE", "off")]
+    #[case("skip_signature", "YES")]
+    #[case("skip_signature", "not-a-boolean")]
+    #[cfg_attr(
+        miri,
+        ignore = "Safe Azure client construction; no unsafe FFI exercised"
+    )]
+    fn auth_bypass_options_match_native_builder(#[case] key: &str, #[case] value: &str) {
+        let url = "az://container/table/";
+        let provider = Arc::new(TestProvider::default());
+        let native = MicrosoftAzureBuilder::new()
+            .with_url(url)
+            .with_config(AzureConfigKey::AccountName, "configured")
+            .with_config(key.to_ascii_lowercase().parse().unwrap(), value)
+            .with_credentials(provider.clone())
+            .build();
+        let ffi = build_store(url, &[(key, value)]);
+        match (native, ffi) {
+            (Ok(native), Ok(ffi)) => assert_eq!(native.to_string(), ffi.to_string()),
+            (Err(native), Err(ffi)) => {
+                assert_eq!(KernelError::from(native).to_string(), ffi.to_string());
+            }
+            _ => panic!("native and FFI construction must agree for {key}={value}"),
+        }
+        assert_eq!(provider.0.load(Ordering::Relaxed), 0);
     }
 
     #[rstest]
@@ -182,27 +189,5 @@ mod tests {
             build_store(url, &[]).unwrap_err().to_string(),
             expected.to_string()
         );
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Safe Azure client construction; no unsafe FFI exercised"
-    )]
-    fn credential_type_follows_native_config_key_support() {
-        let result = build_store(
-            "az://container/table/",
-            &[("AZURE_CREDENTIAL_TYPE", SECRET)],
-        );
-        #[cfg(feature = "arrow-60")]
-        {
-            let error = result.unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("conflicts with azure_credential_type"));
-            assert!(!error.to_string().contains(SECRET));
-        }
-        #[cfg(not(feature = "arrow-60"))]
-        assert!(result.is_ok());
     }
 }

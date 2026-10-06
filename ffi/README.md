@@ -45,8 +45,13 @@ allocators copy their borrowed message and return caller-owned error storage.
 
 Provider mode constructs the built-in Azure backend inside FFI, bypassing custom
 URL handlers. Without a provider, stock URL-handler selection is unchanged.
-Provider mode rejects non-Azure backends, REST attachment, competing authentication
-options and enabled emulator/unsigned-request modes.
+Recognized configuration options are forwarded to the native Azure builder, which
+gives the custom provider precedence over coexisting static or built-in credentials
+during normal credential resolution. `use_emulator=true` selects native emulator
+credentials instead and discards the unused custom provider during construction.
+`skip_signature=true` omits authentication and does not invoke acquisition.
+Attaching a provider enables neither option. Provider mode still rejects non-Azure
+backends and REST attachment.
 Acquisition errors do not fall back to ambient credentials or replay mutations.
 There is no automatic retry or proactive idle acquisition. A subsequent operation
 can retry a failed acquisition; failure kinds distinguish transient, permanent and
@@ -56,6 +61,44 @@ The [C consumer](examples/azure-credentials/README.md) demonstrates owned handle
 direct synchronous acquisition and cleanup using the generated header. Its environment-token
 step is a static demonstration, not an OAuth refresh implementation. Applications
 must supply an identity SDK returning a real token and its real expiry.
+
+### Local Azurite Smoke Test
+
+The ignored `azurite_emulator_roundtrip_bypasses_custom_provider` test exercises
+write, overwrite, HEAD, read and delete through one FFI-built engine on both stock
+executors. It attaches a failing custom provider and checks that native emulator
+authentication bypasses acquisition and releases the unused provider exactly once.
+
+Start an isolated blob service on a free loopback port. Authentication stays enabled;
+`--skipApiVersionCheck` only allows the client's storage API version.
+
+```sh
+azurite-blob --blobHost 127.0.0.1 --blobPort 11006 --inMemoryPersistence --disableTelemetry --skipApiVersionCheck
+```
+
+In a separate PowerShell launch shell, create the private test container using the
+public Azurite development-account key, then run each Arrow track from the repository root:
+
+```powershell
+$connection = 'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:11006/devstoreaccount1;'
+az storage container create --name delta-kernel-ffi-smoke --connection-string $connection --only-show-errors
+$previousEndpoint = $env:AZURITE_BLOB_STORAGE_URL
+try {
+    $env:AZURITE_BLOB_STORAGE_URL = 'http://127.0.0.1:11006'
+    foreach ($arrow in 'arrow-59', 'arrow-60') {
+        cargo test --locked -p delta_kernel_ffi --lib --no-default-features --features "default-engine-rustls,$arrow" azurite_emulator_roundtrip -- --ignored
+        if ($LASTEXITCODE -ne 0) { throw "Azurite smoke failed for $arrow" }
+    }
+} finally {
+    $env:AZURITE_BLOB_STORAGE_URL = $previousEndpoint
+    az storage container delete --name delta-kernel-ffi-smoke --connection-string $connection --only-show-errors
+}
+```
+
+Stop the owned service afterward. With a different port, change both the connection
+string and endpoint override. The test requires an explicit HTTP loopback endpoint,
+does not change process-wide Rust environment settings, and deletes its unique blobs.
+It is ignored in normal test runs and does not establish real Azure/TLS acceptance.
 
 ## Building
 

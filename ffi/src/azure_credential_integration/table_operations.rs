@@ -190,8 +190,10 @@ fn table_callback_counts() -> Arc<CallbackCounts> {
 
 fn wait_for_expiry(runtime: &Runtime, counts: &CallbackCounts) {
     join_workers(counts);
+    let callbacks = counts.starts.load(Ordering::SeqCst);
     let wait_ms = (counts.first_expiry_ms.load(Ordering::SeqCst) - unix_ms()).max(0) as u64 + 25;
     runtime.block_on(async { tokio::time::sleep(Duration::from_millis(wait_ms)).await });
+    assert_eq!(counts.starts.load(Ordering::SeqCst), callbacks);
 }
 
 fn assert_authorization_since(runtime: &Runtime, server: &MockServer, start: usize, token: &str) {
@@ -251,15 +253,15 @@ fn retained_cdc_iterator_renews_after_caller_engine_free(
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
     ));
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     assert_authorization_since(&runtime, &server, 0, "Bearer token-A");
     unsafe { free_engine(engine) };
     drop(kernel_engine);
     assert!(identity.upgrade().is_some());
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     let renewed_start = runtime.block_on(server.received_requests()).unwrap().len();
     wait_for_expiry(&runtime, &counts);
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     assert_eq!(
         runtime.block_on(server.received_requests()).unwrap().len(),
         renewed_start
@@ -288,12 +290,12 @@ fn retained_cdc_iterator_renews_after_caller_engine_free(
     assert_eq!(rows, 3);
     assert_eq!(snapshot.version(), 1);
     join_workers(&counts);
-    assert_counts(&counts, 2, 0);
+    assert_refreshes(&counts, 2, 0);
     assert_authorization_since(&runtime, &server, renewed_start, "Bearer token-B");
     drop(iterator);
     drop(scan);
     assert!(identity.upgrade().is_none());
-    assert_counts(&counts, 2, 1);
+    assert_refreshes(&counts, 2, 1);
 }
 
 #[rstest]
@@ -328,11 +330,11 @@ fn original_snapshot_checkpoint_renews_on_same_ffi_engine(#[case] first_list_del
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
     ));
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     assert_authorization_since(&runtime, &server, 0, "Bearer token-A");
     let renewed_start = runtime.block_on(server.received_requests()).unwrap().len();
     wait_for_expiry(&runtime, &counts);
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     assert_eq!(
         runtime.block_on(server.received_requests()).unwrap().len(),
         renewed_start
@@ -358,7 +360,7 @@ fn original_snapshot_checkpoint_renews_on_same_ffi_engine(#[case] first_list_del
         &unsafe { engine.as_ref() }.engine()
     ));
     join_workers(&counts);
-    assert_counts(&counts, 2, 0);
+    assert_refreshes(&counts, 2, 0);
     assert_authorization_since(&runtime, &server, renewed_start, "Bearer token-B");
     {
         let blobs = table.blobs.lock().unwrap();
@@ -391,16 +393,16 @@ fn original_snapshot_checkpoint_renews_on_same_ffi_engine(#[case] first_list_del
         runtime.block_on(server.received_requests()).unwrap().len(),
         checkpoint_end
     );
-    assert_counts(&counts, 2, 0);
+    assert_refreshes(&counts, 2, 0);
     unsafe { free_snapshot(written) };
     unsafe { free_snapshot(snapshot_handle) };
     drop(snapshot);
     drop(kernel_engine);
     assert!(identity.upgrade().is_some());
-    assert_counts(&counts, 2, 0);
+    assert_refreshes(&counts, 2, 0);
     unsafe { free_engine(engine) };
     assert!(identity.upgrade().is_none());
-    assert_counts(&counts, 2, 1);
+    assert_refreshes(&counts, 2, 1);
 }
 
 #[rstest]
@@ -442,7 +444,7 @@ fn staged_blind_append_renews_on_same_ffi_engine(#[values(false, true)] multithr
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
     ));
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     assert_authorization_since(&runtime, &server, 0, "Bearer token-A");
     let renewed_start = runtime.block_on(server.received_requests()).unwrap().len();
     let mut txn = snapshot
@@ -469,13 +471,13 @@ fn staged_blind_append_renews_on_same_ffi_engine(#[values(false, true)] multithr
         runtime.block_on(server.received_requests()).unwrap().len(),
         renewed_start
     );
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
     wait_for_expiry(&runtime, &counts);
     assert_eq!(
         runtime.block_on(server.received_requests()).unwrap().len(),
         renewed_start
     );
-    assert_counts(&counts, 1, 0);
+    assert_refreshes(&counts, 1, 0);
 
     let committed = txn
         .commit(kernel_engine.as_ref())
@@ -491,7 +493,7 @@ fn staged_blind_append_renews_on_same_ffi_engine(#[values(false, true)] multithr
         &unsafe { engine.as_ref() }.engine()
     ));
     join_workers(&counts);
-    assert_counts(&counts, 2, 0);
+    assert_refreshes(&counts, 2, 0);
     assert_authorization_since(&runtime, &server, renewed_start, "Bearer token-B");
     {
         let blobs = table.blobs.lock().unwrap();
@@ -522,8 +524,8 @@ fn staged_blind_append_renews_on_same_ffi_engine(#[values(false, true)] multithr
     drop(snapshot);
     drop(kernel_engine);
     assert!(identity.upgrade().is_some());
-    assert_counts(&counts, 2, 0);
+    assert_refreshes(&counts, 2, 0);
     unsafe { free_engine(engine) };
     assert!(identity.upgrade().is_none());
-    assert_counts(&counts, 2, 1);
+    assert_refreshes(&counts, 2, 1);
 }

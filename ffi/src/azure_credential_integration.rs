@@ -39,6 +39,7 @@ const TABLE_URL: &str = "abfss://container@account.dfs.core.windows.net/table/";
 #[derive(Default)]
 struct CallbackCounts {
     starts: AtomicUsize,
+    refreshes: AtomicUsize,
     releases: AtomicUsize,
     first_expiry_ms: AtomicI64,
     first_lifetime_ms: AtomicI64,
@@ -56,6 +57,7 @@ enum CallbackOutcome {
 struct CallbackContext {
     counts: Arc<CallbackCounts>,
     outcome: CallbackOutcome,
+    token: Mutex<Option<(&'static str, i64)>>,
 }
 
 extern "C" fn start_request(
@@ -63,37 +65,47 @@ extern "C" fn start_request(
     _request_id: u64,
     ticket: Handle<ExclusiveAzureCredentialRequest>,
     _remaining_ms: u32,
-    _minimum_lifetime_ms: u32,
+    minimum_lifetime_ms: u32,
 ) {
     let context = unsafe { &*context.unwrap().as_ptr().cast::<CallbackContext>() };
     let counts = context.counts.clone();
     let outcome = context.outcome;
-    let generation = counts.starts.fetch_add(1, Ordering::SeqCst) + 1;
+    counts.starts.fetch_add(1, Ordering::SeqCst);
     if matches!(outcome, CallbackOutcome::Abandon) {
         unsafe { free_azure_credential_request(ticket) };
         return;
     }
-    let worker_counts = counts.clone();
+    let mut cached = context.token.lock().unwrap();
+    let (token, expiry) = if matches!(outcome, CallbackOutcome::Fail) {
+        ("", 0)
+    } else if let Some((token, expiry)) =
+        (*cached).filter(|(_, expiry)| *expiry - unix_ms() >= i64::from(minimum_lifetime_ms))
+    {
+        (token, expiry)
+    } else {
+        let generation = counts.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+        let (token, lifetime_ms) = match (outcome, generation) {
+            (CallbackOutcome::Renew, 1) => {
+                let configured = counts.first_lifetime_ms.load(Ordering::SeqCst);
+                ("token-A", if configured > 0 { configured } else { 1_000 })
+            }
+            (CallbackOutcome::Renew, _) => ("token-B", 60_000),
+            _ => ("token-A", 60_000),
+        };
+        let expiry = unix_ms() + lifetime_ms;
+        if generation == 1 {
+            counts.first_expiry_ms.store(expiry, Ordering::SeqCst);
+        }
+        *cached = Some((token, expiry));
+        (token, expiry)
+    };
+    drop(cached);
     let worker = thread::spawn(move || {
         if matches!(outcome, CallbackOutcome::Fail) {
             assert!(ok_or_panic(unsafe {
                 fail_azure_credential_request(ticket, 1, allocate_err)
             }));
         } else {
-            let (token, lifetime_ms) = match (outcome, generation) {
-                (CallbackOutcome::Renew, 1) => {
-                    let configured = worker_counts.first_lifetime_ms.load(Ordering::SeqCst);
-                    ("token-A", if configured > 0 { configured } else { 1_000 })
-                }
-                (CallbackOutcome::Renew, _) => ("token-B", 60_000),
-                _ => ("token-A", 60_000),
-            };
-            let expiry = unix_ms() + lifetime_ms;
-            if generation == 1 {
-                worker_counts
-                    .first_expiry_ms
-                    .store(expiry, Ordering::SeqCst);
-            }
             assert!(ok_or_panic(unsafe {
                 complete_azure_credential_request(
                     ticket,
@@ -123,6 +135,7 @@ fn create_provider_with_outcome(
     let context = Box::new(CallbackContext {
         counts: counts.clone(),
         outcome,
+        token: Mutex::new(None),
     });
     let config = CAzureCredentialProviderConfig {
         abi_version: 1,
@@ -166,6 +179,11 @@ fn with_option(
 
 fn assert_counts(counts: &CallbackCounts, starts: usize, releases: usize) {
     assert_eq!(counts.starts.load(Ordering::SeqCst), starts);
+    assert_eq!(counts.releases.load(Ordering::SeqCst), releases);
+}
+
+fn assert_refreshes(counts: &CallbackCounts, refreshes: usize, releases: usize) {
+    assert_eq!(counts.refreshes.load(Ordering::SeqCst), refreshes);
     assert_eq!(counts.releases.load(Ordering::SeqCst), releases);
 }
 
@@ -371,21 +389,24 @@ fn same_ffi_engine_renews_authorization_for_real_head_read_and_put(
     let file = Url::parse(TABLE_URL).unwrap().join("blob").unwrap();
     exercise_head_read_and_put(storage.as_ref(), &file);
     join_workers(&counts);
-    assert_counts(&counts, 1, 0);
+    assert_counts(&counts, 4, 0);
+    assert_refreshes(&counts, 1, 0);
     assert!(Arc::ptr_eq(
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
     ));
     let wait_ms = (counts.first_expiry_ms.load(Ordering::SeqCst) - unix_ms()).max(0) as u64 + 25;
     runtime.block_on(async { tokio::time::sleep(Duration::from_millis(wait_ms)).await });
-    assert_counts(&counts, 1, 0);
+    assert_counts(&counts, 4, 0);
+    assert_refreshes(&counts, 1, 0);
     assert_eq!(
         runtime.block_on(server.received_requests()).unwrap().len(),
         4
     );
     exercise_head_read_and_put(storage.as_ref(), &file);
     join_workers(&counts);
-    assert_counts(&counts, 2, 0);
+    assert_counts(&counts, 8, 0);
+    assert_refreshes(&counts, 2, 0);
     assert!(Arc::ptr_eq(
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
@@ -413,7 +434,8 @@ fn same_ffi_engine_renews_authorization_for_real_head_read_and_put(
     drop(storage);
     drop(kernel_engine);
     unsafe { free_engine(engine) };
-    assert_counts(&counts, 2, 1);
+    assert_counts(&counts, 8, 1);
+    assert_refreshes(&counts, 2, 1);
 }
 
 #[rstest]

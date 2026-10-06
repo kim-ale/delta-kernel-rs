@@ -13,11 +13,17 @@ The provider is attached before normal Azure store construction. Later requests
 use renewed credentials through the same engine and store; credential renewal
 does not rebuild snapshots. Without a provider, existing construction is unchanged.
 
+Every credential lookup starts an independent caller request. The FFI bridge does
+not cache tokens or combine concurrent requests. The caller's identity SDK owns
+caching, acquisition deduplication and refresh policy. A cached caller result may
+complete synchronously; a cache miss queues asynchronous work. No lookup occurs
+solely because an engine is idle.
+
 `CAzureCredentialProviderConfig` version 1 requires its exact generated structure
 size, Start and Release callbacks, and explicit limits. Acquisition timeout is
 1-120000 milliseconds, minimum remaining token lifetime 1-3600000 milliseconds,
-token size 1-65536 bytes, and outstanding tickets 1-1024. Native waiters are capped
-at 1024. Timed-out foreign tickets retain capacity until completed, failed or freed.
+token size 1-65536 bytes, and outstanding tickets 1-1024. Timed-out foreign tickets
+retain capacity until completed, failed or freed.
 
 Start receives a numeric request ID and one exclusive request ticket. Queue foreign
 acquisition and return promptly. Complete, fail or free that ticket exactly once;
@@ -37,8 +43,10 @@ never reuse the input, including on failure. Freeing the caller's provider refer
 does not invalidate a builder, engine or admitted request that retains it. Error
 allocators copy their borrowed message and return caller-owned error storage.
 
-Provider mode rejects non-Azure backends, custom URL handlers, REST attachment,
-competing authentication options and enabled emulator/unsigned-request modes.
+Provider mode constructs the built-in Azure backend inside FFI, bypassing custom
+URL handlers. Without a provider, stock URL-handler selection is unchanged.
+Provider mode rejects non-Azure backends, REST attachment, competing authentication
+options and enabled emulator/unsigned-request modes.
 Acquisition errors do not fall back to ambient credentials or replay mutations.
 There is no automatic retry or proactive idle acquisition. A subsequent operation
 can retry a failed acquisition; failure kinds distinguish transient, permanent and

@@ -79,9 +79,11 @@ bearer token to a test server; use a synthetic bearer for loopback tests.
 > before using this pattern with real authentication.
 
 Start queues one exclusively owned ticket and returns without doing credential
-work. A full queue frees the rejected ticket once. The worker owns each accepted
+work. Each native credential lookup is independent; this example supplies no token
+cache or acquisition deduplication. A full queue frees the rejected ticket once.
+The worker owns each accepted
 ticket until it completes or fails it once. A false completion result means the
-native request was already retired, not that the consumed ticket can be retried.
+native request was retired or delivery failed, not that the consumed ticket can be retried.
 Cancel records only the numeric request ID, never accesses a raw ticket, and does
 not compete with the worker for ticket ownership. The callbacks use short mutex
 critical sections; no callback performs credential I/O or joins a worker.

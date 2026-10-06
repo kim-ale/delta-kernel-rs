@@ -52,6 +52,8 @@ mod alloc_stats;
 
 #[cfg(feature = "default-engine-base")]
 pub mod azure_credentials;
+#[cfg(feature = "default-engine-base")]
+mod azure_store;
 pub mod column_default;
 pub mod commit_range;
 pub mod delta_types;
@@ -86,8 +88,6 @@ pub mod snapshot_hint;
 
 #[cfg(all(test, feature = "default-engine-base"))]
 mod azure_credential_integration;
-#[cfg(all(test, feature = "default-engine-base", not(miri)))]
-mod credential_provider_u0;
 #[cfg(test)]
 mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
@@ -1074,7 +1074,8 @@ fn builder_with_rest_object_store_impl(
 /// Attach an on-demand Azure bearer provider to normal URL-backed engine construction.
 ///
 /// The provider is retained by the builder and resulting store. No acquisition starts here.
-/// Build rejects non-Azure URLs, custom handlers and conflicting authentication options.
+/// Provider mode selects the built-in Azure backend, not custom URL handlers. Build rejects
+/// non-Azure URLs and conflicting authentication options.
 ///
 /// # Errors
 ///
@@ -1187,15 +1188,11 @@ fn get_default_engine_impl(
     io_config: IoConcurrencyConfig,
     allocate_error: AllocateErrorFn,
 ) -> Result<Handle<SharedExternEngine>> {
-    use delta_kernel_default_engine::storage::{
-        store_from_url_opts, store_from_url_opts_with_azure_credentials,
-    };
+    use delta_kernel_default_engine::storage::store_from_url_opts;
 
     let store = match object_store_backend {
         ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
-        ObjectStoreBackend::UrlAzure(provider) => {
-            store_from_url_opts_with_azure_credentials(&url, options, Some(provider))?
-        }
+        ObjectStoreBackend::UrlAzure(provider) => azure_store::build(&url, options, provider)?,
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(azure_credentials LANGUAGES C CXX)
 
 if(WIN32)
-  message(FATAL_ERROR "azure_credentials uses POSIX pthreads; build under Linux or WSL instead.")
+  message(FATAL_ERROR "azure_credentials uses POSIX mutexes; build under Linux or WSL instead.")
 endif()
 
 get_filename_component(KERNEL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)

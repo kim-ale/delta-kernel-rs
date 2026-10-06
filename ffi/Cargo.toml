@@ -24,7 +24,6 @@ redundant_field_names = "allow"
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
-tokio = { version = "1.47", optional = true, features = ["sync", "time"] }
 bytes = "1.10"
 derive_more = { version = "~2.1", default-features = false, features = ["constructor", "from"] }
 prost = { version = "0.13", optional = true }
@@ -70,7 +69,7 @@ arrow-59 = ["delta_kernel/arrow-59"]
 
 # Internal feature flag with the shared bits between default-engine-native-tls and
 # default-engine-rustls. Enable one of those two on the FFI crate instead to also pick a TLS backend.
-default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "dep:async-trait", "dep:tokio"]
+default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "dep:async-trait"]
 
 # Declarative plan execution via PlanExecutor trait (experimental).
 #

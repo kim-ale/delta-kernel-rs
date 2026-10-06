@@ -189,7 +189,6 @@ fn table_callback_counts() -> Arc<CallbackCounts> {
 }
 
 fn wait_for_expiry(runtime: &Runtime, counts: &CallbackCounts) {
-    join_workers(counts);
     let callbacks = counts.starts.load(Ordering::SeqCst);
     let wait_ms = (counts.first_expiry_ms.load(Ordering::SeqCst) - unix_ms()).max(0) as u64 + 25;
     runtime.block_on(async { tokio::time::sleep(Duration::from_millis(wait_ms)).await });
@@ -218,7 +217,7 @@ fn assert_authorization_since(runtime: &Runtime, server: &MockServer, start: usi
 #[rstest]
 #[cfg_attr(
     miri,
-    ignore = "HTTP/Tokio/Parquet; unsafe covered by owned_callbacks_cover_thread_completion_failure_and_ticket_free, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder"
+    ignore = "HTTP/Tokio/Parquet; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder"
 )]
 fn retained_cdc_iterator_renews_after_caller_engine_free(
     #[values(false, true)] multithreaded: bool,
@@ -289,7 +288,6 @@ fn retained_cdc_iterator_renews_after_caller_engine_free(
     }
     assert_eq!(rows, 3);
     assert_eq!(snapshot.version(), 1);
-    join_workers(&counts);
     assert_refreshes(&counts, 2, 0);
     assert_authorization_since(&runtime, &server, renewed_start, "Bearer token-B");
     drop(iterator);
@@ -303,7 +301,7 @@ fn retained_cdc_iterator_renews_after_caller_engine_free(
 #[case(1_200)]
 #[cfg_attr(
     miri,
-    ignore = "HTTP/Tokio/Parquet; unsafe covered by owned_callbacks_cover_thread_completion_failure_and_ticket_free, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder, tests::test_setting_multithread_executor"
+    ignore = "HTTP/Tokio/Parquet; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder, tests::test_setting_multithread_executor"
 )]
 fn original_snapshot_checkpoint_renews_on_same_ffi_engine(#[case] first_list_delay_ms: u64) {
     let runtime = http_runtime();
@@ -359,7 +357,6 @@ fn original_snapshot_checkpoint_renews_on_same_ffi_engine(#[case] first_list_del
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
     ));
-    join_workers(&counts);
     assert_refreshes(&counts, 2, 0);
     assert_authorization_since(&runtime, &server, renewed_start, "Bearer token-B");
     {
@@ -408,7 +405,7 @@ fn original_snapshot_checkpoint_renews_on_same_ffi_engine(#[case] first_list_del
 #[rstest]
 #[cfg_attr(
     miri,
-    ignore = "HTTP/Tokio/Parquet; unsafe covered by owned_callbacks_cover_thread_completion_failure_and_ticket_free, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder"
+    ignore = "HTTP/Tokio/Parquet; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder, tests::engine_builder_with_option_returns_builder"
 )]
 fn staged_blind_append_renews_on_same_ffi_engine(#[values(false, true)] multithreaded: bool) {
     let runtime = http_runtime();
@@ -492,7 +489,6 @@ fn staged_blind_append_renews_on_same_ffi_engine(#[values(false, true)] multithr
         &kernel_engine,
         &unsafe { engine.as_ref() }.engine()
     ));
-    join_workers(&counts);
     assert_refreshes(&counts, 2, 0);
     assert_authorization_since(&runtime, &server, renewed_start, "Bearer token-B");
     {

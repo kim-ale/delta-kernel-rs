@@ -13,29 +13,29 @@ The provider is attached before normal Azure store construction. Later requests
 use renewed credentials through the same engine and store; credential renewal
 does not rebuild snapshots. Without a provider, existing construction is unchanged.
 
-Every credential lookup starts an independent caller request. The FFI bridge does
-not cache tokens or combine concurrent requests. The caller's identity SDK owns
-caching, acquisition deduplication and refresh policy. A cached caller result may
-complete synchronously; a cache miss queues asynchronous work. No lookup occurs
-solely because an engine is idle.
+Each credential lookup directly invokes a synchronous callback inside the existing
+async Rust provider interface. The caller owns caching, refresh, acquisition timeout
+and cancellation. Acquisition may block the native executor thread, and the kernel
+cannot preempt a hung callback. Do not reenter acquisition on the same provider or
+block on work that requires that executor to make progress. Idle engines do not
+invoke acquisition.
 
-`CAzureCredentialProviderConfig` version 1 requires its exact generated structure
-size, Start and Release callbacks, and explicit limits. Acquisition timeout is
-1-120000 milliseconds, minimum remaining token lifetime 1-3600000 milliseconds,
-token size 1-65536 bytes, and outstanding tickets 1-1024. Timed-out foreign tickets
-retain capacity until completed, failed or freed.
+`CAzureCredentialProviderConfig` ABI version 2 requires the exact generated size,
+Acquire and Release callbacks, minimum remaining lifetime of 1-3600000 milliseconds,
+and a maximum token length of 1-65536 bytes. Version 1's async descriptor is rejected.
 
-Start receives a numeric request ID and one exclusive request ticket. Queue foreign
-acquisition and return promptly. Complete, fail or free that ticket exactly once;
-those calls consume it even on error. Completion copies borrowed token bytes during
-the call and requires the actual absolute UTC expiry in Unix milliseconds. Never
-derive expiry from token text. A false result means retired, not reusable.
+Acquire receives a borrowed `CAzureBearerToken` output and the error allocator.
+Return 0 for success, 1 for transient failure, 2 for permanent failure, or 3 for
+cancelled acquisition. Allocate the token with `allocate_kernel_string`, initialize
+the owned token handle, set its actual UTC Unix-millisecond expiry, then set
+`has_token = 1`. The kernel consumes the returned handle on every status. With
+`has_token = 0` no token field is read. Allocation errors remain caller-owned and
+must be freed by the callback. Raw provider error messages are not propagated.
 
-Cancel is optional and cooperative. It receives the request ID after Start returns
-and never owns the ticket. Release runs once after all provider, builder, store,
-request and active callback ownership ends. All callbacks must be nonblocking,
-nonthrowing, any-thread-safe and safe for concurrent calls. Native timeout cannot
-reclaim a ticket that foreign code still owns or forcibly terminate application work.
+Callbacks must support concurrent any-thread use and never unwind across C.
+Release runs once after the final provider/engine reference and active acquisition
+are gone. There are no completion tickets, request IDs, native acquisition timers,
+late completion, cancellation callbacks or separate acquisition runtime.
 
 The builder setter unconditionally consumes its builder and borrows the provider
 handle, retaining its own reference. Replace the builder with the returned handle;
@@ -53,7 +53,7 @@ can retry a failed acquisition; failure kinds distinguish transient, permanent a
 cancelled results without copying foreign exception text.
 
 The [C consumer](examples/azure-credentials/README.md) demonstrates owned handles,
-queued completion and cleanup using the generated header. Its environment-token
+direct synchronous acquisition and cleanup using the generated header. Its environment-token
 step is a static demonstration, not an OAuth refresh implementation. Applications
 must supply an identity SDK returning a real token and its real expiry.
 

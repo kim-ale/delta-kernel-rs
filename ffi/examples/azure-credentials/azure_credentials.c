@@ -17,17 +17,8 @@ typedef struct ExampleError {
 
 typedef struct Context {
   pthread_mutex_t mutex;
-  pthread_cond_t ready;
-  pthread_t worker;
-  HandleExclusiveAzureCredentialRequest ticket;
-  uint64_t request_id;
-  bool cancelled;
-  bool stopping;
-  unsigned starts;
-  unsigned cancels;
+  unsigned acquisitions;
   unsigned releases;
-  unsigned retired;
-  bool worker_error;
 } Context;
 
 static pthread_mutex_t error_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -62,99 +53,44 @@ static void free_error(EngineError* native_error) {
   pthread_mutex_unlock(&error_mutex);
 }
 
-static void start(NullableCvoid data, uint64_t request_id,
-                  HandleExclusiveAzureCredentialRequest ticket,
-                  uint32_t remaining_ms, uint32_t minimum_lifetime_ms) {
+static uint32_t acquire(NullableCvoid data, CAzureBearerToken* out,
+                        AllocateErrorFn allocator) {
   Context* context = (Context*)data;
-  (void)minimum_lifetime_ms;
   pthread_mutex_lock(&context->mutex);
-  context->starts++;
-  bool accepted = !context->stopping && !context->request_id && remaining_ms;
-  if (accepted) {
-    context->request_id = request_id;
-    context->ticket = ticket;
-    context->cancelled = false;
-    pthread_cond_signal(&context->ready);
+  context->acquisitions++;
+  pthread_mutex_unlock(&context->mutex);
+  const char* token = getenv("AzureStorageBearerToken");
+  size_t length = token ? strnlen(token, 65537) : 0;
+  struct timespec now;
+  if (!length || length > 65536 || clock_gettime(CLOCK_REALTIME, &now)) return 2;
+  KernelStringSlice bearer = { token, length };
+  ExternResultHandleExclusiveRustString result = allocate_kernel_string(bearer, allocator);
+  if (result.tag != OkHandleExclusiveRustString) {
+    free_error(result.err);
+    return 2;
   }
-  pthread_mutex_unlock(&context->mutex);
-  if (!accepted) free_azure_credential_request(ticket);
-}
-
-static void cancel(NullableCvoid data, uint64_t request_id, uint32_t reason) {
-  Context* context = (Context*)data;
-  (void)reason;
-  pthread_mutex_lock(&context->mutex);
-  context->cancels++;
-  if (context->request_id == request_id) context->cancelled = true;
-  pthread_mutex_unlock(&context->mutex);
+  out->token = result.ok;
+  out->expires_unix_ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + 3600000;
+  out->has_token = 1;
+  return 0;
 }
 
 static void release(NullableCvoid data) {
   Context* context = (Context*)data;
   pthread_mutex_lock(&context->mutex);
   context->releases++;
-  pthread_cond_broadcast(&context->ready);
   pthread_mutex_unlock(&context->mutex);
-}
-
-static void* work(void* data) {
-  Context* context = (Context*)data;
-  pthread_mutex_lock(&context->mutex);
-  for (;;) {
-    while (!context->ticket && !context->stopping)
-      pthread_cond_wait(&context->ready, &context->mutex);
-    if (!context->ticket) break;
-    HandleExclusiveAzureCredentialRequest ticket = context->ticket;
-    context->ticket = NULL;
-    bool cancelled = context->cancelled;
-    pthread_mutex_unlock(&context->mutex);
-    const char* token = getenv("AzureStorageBearerToken");
-    size_t length = token ? strnlen(token, 65537) : 0;
-    struct timespec now;
-    ExternResultbool result;
-    if (cancelled || !length || length > 65536 || clock_gettime(CLOCK_REALTIME, &now)) {
-      result = fail_azure_credential_request(ticket, cancelled ? 3 : 2, allocate_error);
-    } else {
-      KernelStringSlice bearer = { token, length };
-      int64_t expiry = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + 3600000;
-      result = complete_azure_credential_request(ticket, bearer, expiry, allocate_error);
-    }
-    bool failed = result.tag != Okbool;
-    if (failed) free_error(result.err);
-    pthread_mutex_lock(&context->mutex);
-    context->worker_error = context->worker_error || failed;
-    if (!failed && !result.ok) context->retired++;
-    context->request_id = 0;
-  }
-  pthread_mutex_unlock(&context->mutex);
-  return NULL;
 }
 
 static bool initialize(Context* context) {
   memset(context, 0, sizeof(*context));
-  if (pthread_mutex_init(&context->mutex, NULL)) return false;
-  if (pthread_cond_init(&context->ready, NULL)) {
-    pthread_mutex_destroy(&context->mutex);
-    return false;
-  }
-  if (pthread_create(&context->worker, NULL, work, context)) {
-    pthread_cond_destroy(&context->ready);
-    pthread_mutex_destroy(&context->mutex);
-    return false;
-  }
-  return true;
+  return pthread_mutex_init(&context->mutex, NULL) == 0;
 }
 
-static bool finish(Context* context, bool wait_for_release) {
+static bool finish(Context* context, bool accepted) {
   pthread_mutex_lock(&context->mutex);
-  while (wait_for_release && !context->releases)
-    pthread_cond_wait(&context->ready, &context->mutex);
-  context->stopping = true;
-  pthread_cond_broadcast(&context->ready);
+  bool valid = context->releases == (accepted ? 1U : 0U);
   pthread_mutex_unlock(&context->mutex);
-  pthread_join(context->worker, NULL);
-  bool valid = !context->worker_error && context->releases == (wait_for_release ? 1U : 0U);
-  pthread_cond_destroy(&context->ready);
   pthread_mutex_destroy(&context->mutex);
   return valid;
 }
@@ -162,15 +98,12 @@ static bool finish(Context* context, bool wait_for_release) {
 static CAzureCredentialProviderConfig configuration(Context* context) {
   CAzureCredentialProviderConfig config;
   memset(&config, 0, sizeof(config));
-  config.abi_version = 1;
+  config.abi_version = 2;
   config.struct_size = (uint32_t)sizeof(config);
-  config.acquisition_timeout_ms = 5000;
   config.minimum_lifetime_ms = 60000;
   config.max_token_bytes = 65536;
-  config.max_outstanding_requests = 1;
   config.context = context;
-  config.start = start;
-  config.cancel = cancel;
+  config.acquire = acquire;
   config.release = release;
   return config;
 }
@@ -197,21 +130,18 @@ static bool invalid_configurations(void) {
   Context context;
   if (!initialize(&context)) return false;
   bool valid = true;
-  for (unsigned test = 0; test < 13; test++) {
+  for (unsigned test = 0; test < 10; test++) {
     CAzureCredentialProviderConfig config = configuration(&context);
     switch (test) {
       case 1: config.abi_version = 0; break;
       case 2: config.struct_size--; break;
-      case 3: config.acquisition_timeout_ms = 0; break;
+      case 3: config.abi_version = 1; break;
       case 4: config.minimum_lifetime_ms = 0; break;
       case 5: config.max_token_bytes = 0; break;
-      case 6: config.max_outstanding_requests = 0; break;
-      case 7: config.start = NULL; break;
-      case 8: config.release = NULL; break;
-      case 9: config.acquisition_timeout_ms = 120001; break;
-      case 10: config.minimum_lifetime_ms = 3600001; break;
-      case 11: config.max_token_bytes = 65537; break;
-      case 12: config.max_outstanding_requests = 1025; break;
+      case 6: config.acquire = NULL; break;
+      case 7: config.release = NULL; break;
+      case 8: config.minimum_lifetime_ms = 3600001; break;
+      case 9: config.max_token_bytes = 65537; break;
       default: break;
     }
     ExternResultHandleSharedAzureCredentialProvider result =
@@ -222,7 +152,7 @@ static bool invalid_configurations(void) {
       valid = false;
     }
   }
-  return finish(&context, false) && valid && !context.starts && !context.cancels;
+  return finish(&context, false) && valid && !context.acquisitions;
 }
 
 static const char* test_url = "abfss://container@account.dfs.core.windows.net/table/";
@@ -292,7 +222,7 @@ static bool lifecycle(unsigned scenario) {
   if (builder) free_engine_builder(builder);
   for (unsigned index = 0; index < 2; index++) {
     valid = finish(&contexts[index], created[index]) && valid;
-    valid = !contexts[index].starts && !contexts[index].cancels && valid;
+    valid = !contexts[index].acquisitions && valid;
   }
   return valid;
 }
@@ -342,8 +272,8 @@ static bool read_table(const char* url, const char* endpoint) {
   }
   if (builder) free_engine_builder(builder);
   valid = finish(&context, true) && valid;
-  printf("Credential starts: %u; releases: %u; retired completions: %u\n",
-         context.starts, context.releases, context.retired);
+    printf("Credential acquisitions: %u; releases: %u\n",
+      context.acquisitions, context.releases);
   return valid;
 }
 

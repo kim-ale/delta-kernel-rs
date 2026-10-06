@@ -1,7 +1,6 @@
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -15,21 +14,20 @@ use wiremock::matchers::{body_bytes, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::azure_credentials::{
-    complete_azure_credential_request, create_azure_credential_provider,
-    fail_azure_credential_request, free_azure_credential_provider, free_azure_credential_request,
-    CAzureCredentialProviderConfig, ExclusiveAzureCredentialRequest, SharedAzureCredentialProvider,
+    create_azure_credential_provider, free_azure_credential_provider, CAzureBearerToken,
+    CAzureCredentialProviderConfig, SharedAzureCredentialProvider,
 };
-use crate::error::FFIKernelError;
+use crate::error::{AllocateErrorFn, FFIKernelError};
 use crate::ffi_test_utils::{
     allocate_err, assert_extern_result_error_contains, error_only_engine_handle, ok_or_panic,
 };
 use crate::handle::Handle;
 use crate::rest_engine::CRestEndpointConfig;
 use crate::{
-    builder_build, builder_with_azure_credential_provider, builder_with_multithreaded_executor,
-    builder_with_option, builder_with_rest_object_store, free_engine, free_engine_builder,
-    get_engine_builder, kernel_string_slice, ExclusiveEngineBuilder, NullableCvoid,
-    SharedExternEngine,
+    allocate_kernel_string, builder_build, builder_with_azure_credential_provider,
+    builder_with_multithreaded_executor, builder_with_option, builder_with_rest_object_store,
+    free_engine, free_engine_builder, get_engine_builder, kernel_string_slice,
+    ExclusiveEngineBuilder, NullableCvoid, SharedExternEngine,
 };
 
 mod table_operations;
@@ -43,12 +41,11 @@ struct CallbackCounts {
     releases: AtomicUsize,
     first_expiry_ms: AtomicI64,
     first_lifetime_ms: AtomicI64,
-    workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum CallbackOutcome {
-    Abandon,
+    Missing,
     Fail,
     Complete,
     Renew,
@@ -60,27 +57,22 @@ struct CallbackContext {
     token: Mutex<Option<(&'static str, i64)>>,
 }
 
-extern "C" fn start_request(
+extern "C" fn acquire_token(
     context: NullableCvoid,
-    _request_id: u64,
-    ticket: Handle<ExclusiveAzureCredentialRequest>,
-    _remaining_ms: u32,
-    minimum_lifetime_ms: u32,
-) {
+    out: *mut CAzureBearerToken,
+    allocate_error: AllocateErrorFn,
+) -> u32 {
     let context = unsafe { &*context.unwrap().as_ptr().cast::<CallbackContext>() };
     let counts = context.counts.clone();
     let outcome = context.outcome;
     counts.starts.fetch_add(1, Ordering::SeqCst);
-    if matches!(outcome, CallbackOutcome::Abandon) {
-        unsafe { free_azure_credential_request(ticket) };
-        return;
+    if matches!(outcome, CallbackOutcome::Missing) {
+        return 0;
     }
     let mut cached = context.token.lock().unwrap();
     let (token, expiry) = if matches!(outcome, CallbackOutcome::Fail) {
-        ("", 0)
-    } else if let Some((token, expiry)) =
-        (*cached).filter(|(_, expiry)| *expiry - unix_ms() >= i64::from(minimum_lifetime_ms))
-    {
+        ("token-A", 0)
+    } else if let Some((token, expiry)) = (*cached).filter(|(_, expiry)| *expiry - unix_ms() >= 1) {
         (token, expiry)
     } else {
         let generation = counts.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -100,23 +92,20 @@ extern "C" fn start_request(
         (token, expiry)
     };
     drop(cached);
-    let worker = thread::spawn(move || {
-        if matches!(outcome, CallbackOutcome::Fail) {
-            assert!(ok_or_panic(unsafe {
-                fail_azure_credential_request(ticket, 1, allocate_err)
-            }));
-        } else {
-            assert!(ok_or_panic(unsafe {
-                complete_azure_credential_request(
-                    ticket,
-                    kernel_string_slice!(token),
-                    expiry,
-                    allocate_err,
-                )
-            }));
-        }
-    });
-    counts.workers.lock().unwrap().push(worker);
+    // SAFETY: The callback initializes the token before setting its presence flag.
+    unsafe {
+        (*out).token = ok_or_panic(allocate_kernel_string(
+            kernel_string_slice!(token),
+            allocate_error,
+        ));
+        (*out).has_token = 1;
+        (*out).expires_unix_ms = expiry;
+    }
+    if matches!(outcome, CallbackOutcome::Fail) {
+        1
+    } else {
+        0
+    }
 }
 
 extern "C" fn release_context(context: NullableCvoid) {
@@ -125,7 +114,7 @@ extern "C" fn release_context(context: NullableCvoid) {
 }
 
 fn create_provider(counts: &Arc<CallbackCounts>) -> Handle<SharedAzureCredentialProvider> {
-    create_provider_with_outcome(counts, CallbackOutcome::Abandon)
+    create_provider_with_outcome(counts, CallbackOutcome::Missing)
 }
 
 fn create_provider_with_outcome(
@@ -138,15 +127,12 @@ fn create_provider_with_outcome(
         token: Mutex::new(None),
     });
     let config = CAzureCredentialProviderConfig {
-        abi_version: 1,
+        abi_version: 2,
         struct_size: std::mem::size_of::<CAzureCredentialProviderConfig>() as u32,
-        acquisition_timeout_ms: 5_000,
         minimum_lifetime_ms: 1,
         max_token_bytes: 256,
-        max_outstanding_requests: 2,
         context: NonNull::new(Box::into_raw(context).cast()),
-        start: Some(start_request),
-        cancel: None,
+        acquire: Some(acquire_token),
         release: Some(release_context),
     };
     ok_or_panic(unsafe { create_azure_credential_provider(&config, allocate_err) })
@@ -192,13 +178,6 @@ fn unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-}
-
-fn join_workers(counts: &CallbackCounts) {
-    let workers = std::mem::take(&mut *counts.workers.lock().unwrap());
-    for worker in workers {
-        worker.join().unwrap();
-    }
 }
 
 fn rest_config() -> CRestEndpointConfig {
@@ -247,11 +226,11 @@ fn caller_provider_free_leaves_builder_reference_until_abandonment(
 }
 
 #[rstest]
-fn owned_callbacks_cover_thread_completion_failure_and_ticket_free(
+fn owned_callbacks_consume_token_on_success_and_failure(
     #[values(
         CallbackOutcome::Complete,
         CallbackOutcome::Fail,
-        CallbackOutcome::Abandon
+        CallbackOutcome::Missing
     )]
     outcome: CallbackOutcome,
 ) {
@@ -262,7 +241,6 @@ fn owned_callbacks_cover_thread_completion_failure_and_ticket_free(
         .build()
         .unwrap();
     let result = runtime.block_on(unsafe { provider.as_ref() }.get_credential());
-    join_workers(&counts);
     match outcome {
         CallbackOutcome::Complete => assert!(matches!(
             result.unwrap().as_ref(),
@@ -271,8 +249,8 @@ fn owned_callbacks_cover_thread_completion_failure_and_ticket_free(
         CallbackOutcome::Fail => {
             assert!(result.unwrap_err().to_string().contains("transient"));
         }
-        CallbackOutcome::Abandon => {
-            assert!(result.unwrap_err().to_string().contains("abandoned"));
+        CallbackOutcome::Missing => {
+            assert!(result.unwrap_err().to_string().contains("missing"));
         }
         CallbackOutcome::Renew => unreachable!(),
     }
@@ -338,7 +316,7 @@ fn exercise_head_read_and_put(storage: &dyn StorageHandler, file: &Url) {
 #[rstest]
 #[cfg_attr(
     miri,
-    ignore = "HTTP/Tokio runtimes; unsafe covered by owned_callbacks_cover_thread_completion_failure_and_ticket_free, caller_provider_free_leaves_builder_reference_until_abandonment, rejected_build_consumes_builder_and_releases_provider_without_acquisition, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder"
+    ignore = "HTTP/Tokio runtimes; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, rejected_build_consumes_builder_and_releases_provider_without_acquisition, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder"
 )]
 fn same_ffi_engine_renews_authorization_for_real_head_read_and_put(
     #[values(false, true)] multithreaded: bool,
@@ -388,7 +366,6 @@ fn same_ffi_engine_renews_authorization_for_real_head_read_and_put(
     let storage = kernel_engine.storage_handler();
     let file = Url::parse(TABLE_URL).unwrap().join("blob").unwrap();
     exercise_head_read_and_put(storage.as_ref(), &file);
-    join_workers(&counts);
     assert_counts(&counts, 4, 0);
     assert_refreshes(&counts, 1, 0);
     assert!(Arc::ptr_eq(
@@ -404,7 +381,6 @@ fn same_ffi_engine_renews_authorization_for_real_head_read_and_put(
         4
     );
     exercise_head_read_and_put(storage.as_ref(), &file);
-    join_workers(&counts);
     assert_counts(&counts, 8, 0);
     assert_refreshes(&counts, 2, 0);
     assert!(Arc::ptr_eq(
@@ -441,11 +417,11 @@ fn same_ffi_engine_renews_authorization_for_real_head_read_and_put(
 #[rstest]
 #[cfg_attr(
     miri,
-    ignore = "HTTP/Tokio runtimes; unsafe covered by owned_callbacks_cover_thread_completion_failure_and_ticket_free, caller_provider_free_leaves_builder_reference_until_abandonment, rejected_build_consumes_builder_and_releases_provider_without_acquisition, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder"
+    ignore = "HTTP/Tokio runtimes; unsafe covered by owned_callbacks_consume_token_on_success_and_failure, caller_provider_free_leaves_builder_reference_until_abandonment, rejected_build_consumes_builder_and_releases_provider_without_acquisition, engine_handle_borrow_and_free_keep_ownership, tests::engine_builder"
 )]
 fn failed_acquisition_sends_no_http_and_only_retries_on_new_operation(
     #[values(false, true)] multithreaded: bool,
-    #[values(CallbackOutcome::Fail, CallbackOutcome::Abandon)] outcome: CallbackOutcome,
+    #[values(CallbackOutcome::Fail, CallbackOutcome::Missing)] outcome: CallbackOutcome,
 ) {
     let runtime = http_runtime();
     let server = runtime.block_on(MockServer::start());
@@ -456,7 +432,7 @@ fn failed_acquisition_sends_no_http_and_only_retries_on_new_operation(
     let file = Url::parse(TABLE_URL).unwrap().join("blob").unwrap();
     let expected_error = match outcome {
         CallbackOutcome::Fail => "transient",
-        CallbackOutcome::Abandon => "abandoned",
+        CallbackOutcome::Missing => "missing",
         _ => unreachable!(),
     };
     for attempt in 1..=2 {
@@ -465,7 +441,6 @@ fn failed_acquisition_sends_no_http_and_only_retries_on_new_operation(
             .unwrap_err()
             .to_string()
             .contains(expected_error));
-        join_workers(&counts);
         assert_counts(&counts, attempt, 0);
         assert!(runtime
             .block_on(server.received_requests())

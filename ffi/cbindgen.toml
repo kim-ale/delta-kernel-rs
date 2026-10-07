@@ -26,4 +26,4 @@ parse_deps = true
 # only crates found in this list will ever be parsed.
 #
 # default: there is no allow-list (NOTE: this is the opposite of [])
-include = ["arrow", "arrow-data", "arrow-schema", "delta_kernel"]
+include = ["arrow", "arrow-data", "arrow-schema", "delta_kernel", "delta_kernel_native_store_abi"]

@@ -62,6 +62,8 @@ pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
 #[cfg(feature = "default-engine-base")]
+pub mod native_object_store;
+#[cfg(feature = "default-engine-base")]
 pub mod rest_engine;
 #[cfg(feature = "default-engine-base")]
 pub mod table_changes;
@@ -811,6 +813,8 @@ pub(crate) enum ObjectStoreBackend {
     UrlScheme,
     /// REST file API; configured via [`builder_with_rest_object_store`].
     Rest(Box<rest_engine::RestBuilderState>),
+    /// Independent native provider; configured via [`builder_with_object_store`].
+    Native(Arc<native_object_store::NativeObjectStore>),
 }
 
 /// A builder that allows setting options on the `Engine` before actually building it.
@@ -818,6 +822,8 @@ pub(crate) enum ObjectStoreBackend {
 /// For a normal object store backend, `url` is the table storage location (`s3://…`, `file://…`).
 /// For REST, call [`builder_with_rest_object_store`] with a [`rest_engine::CRestEndpointConfig`]
 /// and set `url` to the REST service base URL; see [`rest_engine`] for TLS and auth options.
+/// For an independent native provider, call [`builder_with_object_store`]; the provider owns
+/// storage configuration, and URL-scheme options are not used to construct its store.
 #[cfg(feature = "default-engine-base")]
 pub struct FfiEngineBuilder {
     url: Url,
@@ -1056,6 +1062,31 @@ fn builder_with_rest_object_store_impl(
     Ok(())
 }
 
+/// Select an independently constructed native object store and return the updated builder.
+///
+/// `builder` is consumed unconditionally. `store` is borrowed only for this call; the builder
+/// retains its own shared reference, so the caller may then free the store handle. The last
+/// object-store setter wins, replacing any previous REST or native backend. This call performs
+/// no I/O and does not invoke provider callbacks except final release of a replaced backend.
+/// The builder's error allocator and executor/I/O settings are unchanged.
+///
+/// # Safety
+///
+/// Both handles must be valid. The input builder must not be used or freed again; the returned
+/// builder must eventually be built or freed. The store handle remains owned by the caller and
+/// must not be freed concurrently with this call. Provider callbacks and context must satisfy
+/// [`native_object_store::get_native_object_store`]'s lifetime and concurrency contract.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn builder_with_object_store(
+    builder: Handle<ExclusiveEngineBuilder>,
+    store: Handle<native_object_store::SharedNativeObjectStore>,
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    builder.object_store_backend = ObjectStoreBackend::Native(unsafe { store.clone_as_arc() });
+    ExternResult::Ok(builder.into())
+}
+
 /// Consume the builder and return a default engine. The builder is consumed regardless of the
 /// result and must not be used or freed after this call.
 ///
@@ -1140,17 +1171,18 @@ fn get_default_engine_impl(
 ) -> KernelResult<Handle<SharedExternEngine>> {
     use delta_kernel_default_engine::storage::store_from_url_opts;
 
-    let store = match object_store_backend {
+    let store: Arc<dyn ObjectStore> = match object_store_backend {
         ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
+        ObjectStoreBackend::Native(store) => store,
     };
     build_engine_from_store(store, executor_config, io_config, allocate_error)
 }
 
 /// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O
-/// tuning. Shared by the URL-scheme and REST engine builder paths.
+/// tuning. Shared by the URL-scheme, REST, and native engine builder paths.
 #[cfg(feature = "default-engine-base")]
 pub(crate) fn build_engine_from_store(
     store: Arc<dyn ObjectStore>,

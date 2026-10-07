@@ -23,9 +23,13 @@ crate-type = ["lib", "cdylib", "staticlib"]
 redundant_field_names = "allow"
 
 [dependencies]
+async-trait = { version = "0.1", optional = true }
 bytes = "1.10"
+chrono = { version = "0.4.41", optional = true }
 derive_more = { version = "~2.1", default-features = false, features = ["constructor", "from"] }
+futures = { version = "0.3", optional = true }
 prost = { version = "0.13", optional = true }
+tokio = { version = "1.47", features = ["rt"], optional = true }
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -37,6 +41,7 @@ delta_kernel = { path = "../kernel", default-features = false, features = [
 ] }
 delta_kernel_default_engine = { path = "../default-engine", default-features = false, optional = true }
 delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.29.0" }
+delta_kernel_native_store_abi = { path = "native-store-abi", optional = true }
 delta-kernel-unity-catalog = { path = "../delta-kernel-unity-catalog", optional = true }
 unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", optional = true }
 
@@ -66,7 +71,7 @@ arrow-59 = ["delta_kernel/arrow-59"]
 
 # Internal feature flag with the shared bits between default-engine-native-tls and
 # default-engine-rustls. Enable one of those two on the FFI crate instead to also pick a TLS backend.
-default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine"]
+default-engine-base = ["delta_kernel/default-engine-base", "dep:delta_kernel_default_engine", "dep:delta_kernel_native_store_abi", "dep:async-trait", "dep:chrono", "dep:futures", "dep:tokio"]
 
 # Declarative plan execution via PlanExecutor trait (experimental).
 #

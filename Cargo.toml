@@ -6,6 +6,7 @@ members = [
     "default-engine/test-utils",
     "derive-macros",
     "ffi",
+    "ffi/native-store-abi",
     "kernel",
     "kernel/examples/*",
     "test-utils",

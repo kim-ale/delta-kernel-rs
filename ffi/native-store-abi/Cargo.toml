@@ -1,0 +1,5 @@
+[package]
+name = "delta_kernel_native_store_abi"
+version = "0.1.0"
+edition = "2021"
+publish = false

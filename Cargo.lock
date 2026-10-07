@@ -1644,13 +1644,17 @@ dependencies = [
 name = "delta_kernel_ffi"
 version = "0.29.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "cbindgen",
+ "chrono",
  "delta-kernel-unity-catalog",
  "delta_kernel",
  "delta_kernel_default_engine",
  "delta_kernel_ffi_macros",
+ "delta_kernel_native_store_abi",
  "derive_more",
+ "futures",
  "itertools 0.14.0",
  "libc",
  "paste",
@@ -1679,6 +1683,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "delta_kernel_native_store_abi"
+version = "0.1.0"
 
 [[package]]
 name = "delta_kernel_workloads"

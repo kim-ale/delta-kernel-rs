@@ -1,0 +1,23 @@
+[package]
+name = "native-object-store-provider"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "native_object_store_provider"
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+delta_kernel_native_store_abi = { path = "../../native-store-abi" }
+futures = "0.3"
+object_store = { version = "=0.14.2", default-features = false, features = ["azure", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

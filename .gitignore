@@ -35,5 +35,6 @@ ffi/examples/visit-expression/build
 /build
 /kernel/target
 /target
+/target-provider/
 
 /benchmarks/workloads/

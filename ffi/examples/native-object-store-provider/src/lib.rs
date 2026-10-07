@@ -1,11 +1,11 @@
-//! Independent native ObjectStore prototype. Only the v3 C descriptor crosses DLL boundaries.
+//! Independent native ObjectStore prototype. Only the v4 C descriptor crosses DLL boundaries.
 //! The provider module and its runtime must stay loaded for the lifetime of the process.
 
 use std::ffi::c_void;
 use std::mem::size_of;
 
 use delta_kernel_native_store_abi::{
-    KernelNativeObjectStoreDescriptorV3, KernelNativeStringSliceV1, KERNEL_NATIVE_STATUS_GENERIC,
+    KernelNativeObjectStoreDescriptorV4, KernelNativeStringSliceV1, KERNEL_NATIVE_STATUS_GENERIC,
 };
 
 mod credentials;
@@ -20,10 +20,10 @@ mod provider;
 /// Call from an ordinary thread, not an asynchronous runtime worker.
 #[no_mangle]
 pub unsafe extern "C" fn prototype_create_memory(
-    out: *mut KernelNativeObjectStoreDescriptorV3,
+    out: *mut KernelNativeObjectStoreDescriptorV4,
 ) -> i32 {
     provider::guarded(|| {
-        if out.is_null() {
+        if out.is_null() || !out.is_aligned() {
             return Err(KERNEL_NATIVE_STATUS_GENERIC);
         }
         let context = provider::create_memory()?;
@@ -46,10 +46,10 @@ pub unsafe extern "C" fn prototype_create_memory(
 #[no_mangle]
 pub unsafe extern "C" fn prototype_create_azure(
     endpoint: KernelNativeStringSliceV1,
-    out: *mut KernelNativeObjectStoreDescriptorV3,
+    out: *mut KernelNativeObjectStoreDescriptorV4,
 ) -> i32 {
     provider::guarded(|| {
-        if out.is_null() {
+        if out.is_null() || !out.is_aligned() {
             return Err(KERNEL_NATIVE_STATUS_GENERIC);
         }
         // SAFETY: The endpoint is readable through this call and is copied before client creation.
@@ -95,8 +95,9 @@ pub extern "C" fn prototype_credential_generation() -> u64 {
     credentials::generation()
 }
 
-/// Returns the aggregate process-global GET, LIST advance, PUT and DELETE invocation count.
-/// Includes failed attempts; excludes LIST open/close, factories, sinks, direct append and release.
+/// Returns process-global GET/ranges, LIST advance/delimiter, PUT/copy/rename, multipart
+/// open/part-open/complete, and DELETE-batch attempts, including failures. Excludes waits, aborts,
+/// closes, LIST open, factories, sinks, direct append, and release.
 #[no_mangle]
 pub extern "C" fn prototype_callback_count() -> u64 {
     provider::callback_count()
@@ -105,5 +106,5 @@ pub extern "C" fn prototype_callback_count() -> u64 {
 /// Returns this library's exact descriptor size for the current platform, without packing.
 #[no_mangle]
 pub extern "C" fn prototype_descriptor_size() -> u32 {
-    size_of::<KernelNativeObjectStoreDescriptorV3>() as u32
+    size_of::<KernelNativeObjectStoreDescriptorV4>() as u32
 }

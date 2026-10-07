@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
+chrono = "0.4"
 delta_kernel_native_store_abi = { path = "../../native-store-abi" }
 futures = "0.3"
 object_store = { version = "=0.14.2", default-features = false, features = ["azure", "fs"] }

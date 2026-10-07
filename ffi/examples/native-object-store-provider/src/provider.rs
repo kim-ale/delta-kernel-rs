@@ -6,20 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
-use delta_kernel_native_store_abi::{
-    KernelNativeByteSliceV1, KernelNativeGetOptionsV3, KernelNativeObjectMetaV1,
-    KernelNativeObjectStoreDescriptorV3, KernelNativeStringSliceV1, KERNEL_NATIVE_LIST_BATCH_SIZE,
-    KERNEL_NATIVE_PUT_CREATE, KERNEL_NATIVE_PUT_OVERWRITE, KERNEL_NATIVE_STATUS_ALREADY_EXISTS,
-    KERNEL_NATIVE_STATUS_GENERIC, KERNEL_NATIVE_STATUS_NOT_FOUND,
-    KERNEL_NATIVE_STATUS_NOT_SUPPORTED, KERNEL_NATIVE_STATUS_OK, KERNEL_NATIVE_STORE_ABI_V3,
-};
+use delta_kernel_native_store_abi::*;
 use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use object_store::azure::MicrosoftAzureBuilder;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, RetryConfig,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, PutMode, PutOptions, RetryConfig,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -40,6 +34,11 @@ const INITIAL_COMMIT: &str = concat!(
     "\"partitionColumns\":[],\"configuration\":{},\"createdTime\":0}}\n",
 );
 const APPEND_COMMIT: &str = "{\"commitInfo\":{\"timestamp\":1}}\n";
+
+mod marshalling;
+mod multipart;
+mod operations;
+use marshalling::{borrowed_metadata, charge, check_metadata, optional_string, string_view};
 
 static RUNTIME: OnceLock<Result<Runtime, i32>> = OnceLock::new();
 static RELEASES: AtomicU64 = AtomicU64::new(0);
@@ -97,17 +96,28 @@ pub(crate) fn create_azure(endpoint: String) -> Result<ProviderContext, i32> {
     })
 }
 
-pub(crate) fn descriptor(context: ProviderContext) -> KernelNativeObjectStoreDescriptorV3 {
-    KernelNativeObjectStoreDescriptorV3 {
-        abi_version: KERNEL_NATIVE_STORE_ABI_V3,
-        struct_size: size_of::<KernelNativeObjectStoreDescriptorV3>() as u32,
+pub(crate) fn descriptor(context: ProviderContext) -> KernelNativeObjectStoreDescriptorV4 {
+    KernelNativeObjectStoreDescriptorV4 {
+        abi_version: KERNEL_NATIVE_STORE_ABI_V4,
+        struct_size: size_of::<KernelNativeObjectStoreDescriptorV4>() as u32,
         context: Box::into_raw(Box::new(context)).cast(),
         get: Some(get),
+        get_ranges: Some(operations::get_ranges),
         list_open: Some(list_open),
         list_next: Some(list_next),
         list_close: Some(list_close),
+        list_delimiter: Some(operations::list_delimiter),
         put: Some(put),
-        delete_object: Some(delete_object),
+        delete_batch: Some(operations::delete_batch),
+        copy: Some(operations::copy),
+        rename: Some(operations::rename),
+        multipart_open: Some(multipart::open),
+        multipart_part_open: Some(multipart::part_open),
+        multipart_part_wait: Some(multipart::part_wait),
+        multipart_part_close: Some(multipart::part_close),
+        multipart_complete: Some(multipart::complete),
+        multipart_abort: Some(multipart::abort),
+        multipart_close: Some(multipart::close),
         release: Some(release),
     }
 }
@@ -170,14 +180,16 @@ pub(crate) unsafe fn copy_string(value: KernelNativeStringSliceV1) -> Result<Str
 unsafe extern "C" fn get(
     context: *mut c_void,
     path: KernelNativeStringSliceV1,
-    options: KernelNativeGetOptionsV3,
+    options: KernelNativeGetOptionsV4,
     sink_context: *mut c_void,
     sink: unsafe extern "C" fn(
         *mut c_void,
-        *const KernelNativeObjectMetaV1,
+        *const KernelNativeObjectMetaV4,
         KernelNativeByteSliceV1,
         u64,
         u64,
+        *const KernelNativeKeyValueV4,
+        usize,
     ) -> i32,
 ) -> i32 {
     guarded(|| {
@@ -188,27 +200,35 @@ unsafe extern "C" fn get(
         // SAFETY: Kernel retains the provider context and input through callback return.
         let (context, path) = unsafe { (context_ref(context)?, copy_path(path)?) };
         let path = Path::parse(path).map_err(|_| KERNEL_NATIVE_STATUS_GENERIC)?;
-        let options = native_get_options(options)?;
+        let mut request_bytes = path.as_ref().len();
+        let options = unsafe { marshalling::get_options(options, &mut request_bytes) }?;
         let head = options.head;
-        let (object_metadata, range, body) = runtime()?.block_on(async {
+        let (object_metadata, range, body, attributes) = runtime()?.block_on(async {
             let result = context
                 .store
                 .get_opts(&path, options)
                 .await
                 .map_err(error_status)?;
+            let mut budget = 0;
+            check_metadata(&result.meta, &mut budget)?;
             let metadata = result.meta.clone();
-            if metadata.location.as_ref().len() > MAX_PATH_BYTES {
-                return Err(KERNEL_NATIVE_STATUS_NOT_SUPPORTED);
-            }
+            let attributes = marshalling::attribute_pairs(&result.attributes, &mut budget)?;
             let range = result.range.clone();
+            if range.start > range.end || range.end > metadata.size {
+                return Err(KERNEL_NATIVE_STATUS_GENERIC);
+            }
             let body = if head {
                 Bytes::new()
             } else {
-                bounded_body(result, MAX_BODY_BYTES).await?
+                bounded_body(result, MAX_BODY_BYTES - budget).await?
             };
-            Ok::<_, i32>((metadata, range, body))
+            if !head && body.len() as u64 != range.end - range.start {
+                return Err(KERNEL_NATIVE_STATUS_GENERIC);
+            }
+            Ok::<_, i32>((metadata, range, body, attributes))
         })?;
         let metadata = borrowed_metadata(&object_metadata);
+        let attributes = marshalling::pair_views(&attributes);
         // SAFETY: All output storage lives through this one synchronous sink call; nothing is
         // retained.
         let status = unsafe {
@@ -221,6 +241,8 @@ unsafe extern "C" fn get(
                 },
                 range.start,
                 range.end,
+                attributes.as_ptr(),
+                attributes.len(),
             )
         };
         sink_status(status)
@@ -275,7 +297,7 @@ unsafe extern "C" fn list_open(
 unsafe extern "C" fn list_next(
     cursor: *mut c_void,
     sink_context: *mut c_void,
-    sink: unsafe extern "C" fn(*mut c_void, *const KernelNativeObjectMetaV1) -> i32,
+    sink: unsafe extern "C" fn(*mut c_void, *const KernelNativeObjectMetaV4) -> i32,
     has_more: *mut u32,
 ) -> i32 {
     guarded(|| {
@@ -291,6 +313,7 @@ unsafe extern "C" fn list_next(
         // SAFETY: The caller exclusively borrows this live cursor until advance returns.
         let cursor = unsafe { &mut *cursor.cast::<ProviderCursor>() };
         runtime()?.block_on(async {
+            let mut budget = 0;
             if !cursor.exhausted {
                 for _ in 0..MAX_LIST_ITEMS {
                     let Some(metadata) = cursor.stream.try_next().await.map_err(error_status)?
@@ -298,9 +321,7 @@ unsafe extern "C" fn list_next(
                         cursor.exhausted = true;
                         break;
                     };
-                    if metadata.location.as_ref().len() > MAX_PATH_BYTES {
-                        return Err(KERNEL_NATIVE_STATUS_NOT_SUPPORTED);
-                    }
+                    check_metadata(&metadata, &mut budget)?;
                     let metadata = borrowed_metadata(&metadata);
                     // SAFETY: Metadata and its path remain live through the serial sink call.
                     sink_status(unsafe { sink(sink_context, &metadata) })?;
@@ -330,53 +351,45 @@ unsafe extern "C" fn put(
     context: *mut c_void,
     path: KernelNativeStringSliceV1,
     body: KernelNativeByteSliceV1,
-    mode: u32,
+    options: KernelNativeWriteOptionsV4,
+    sink_context: *mut c_void,
+    sink: unsafe extern "C" fn(*mut c_void, *const KernelNativePutResultV4) -> i32,
 ) -> i32 {
     guarded(|| {
         PUTS.fetch_add(1, Ordering::SeqCst);
+        if sink_context.is_null() {
+            return Err(KERNEL_NATIVE_STATUS_GENERIC);
+        }
         // SAFETY: The caller retains context and readable input through callback return.
         let (context, path) = unsafe { (context_ref(context)?, copy_path(path)?) };
         let path = Path::parse(path).map_err(|_| KERNEL_NATIVE_STATUS_GENERIC)?;
-        let mode = match mode {
-            KERNEL_NATIVE_PUT_CREATE => PutMode::Create,
-            KERNEL_NATIVE_PUT_OVERWRITE => PutMode::Overwrite,
-            _ => return Err(KERNEL_NATIVE_STATUS_NOT_SUPPORTED),
-        };
-        if body.len > MAX_BODY_BYTES {
-            return Err(KERNEL_NATIVE_STATUS_NOT_SUPPORTED);
-        }
+        let mut budget = path.as_ref().len();
+        let options = unsafe { marshalling::write_options(options, false, &mut budget) }?;
+        charge(&mut budget, body.len)?;
         // SAFETY: The size bound is checked before reading or copying the borrowed payload.
         let body = unsafe { copy_bytes(body) }?;
-        runtime()?
+        let result = runtime()?
             .block_on(context.store.put_opts(
                 &path,
                 Bytes::from(body).into(),
                 PutOptions {
-                    mode,
+                    mode: options.mode,
+                    tags: options.tags,
+                    attributes: options.attributes,
                     ..Default::default()
                 },
             ))
             .map_err(error_status)?;
-        Ok(())
-    })
-}
-
-unsafe extern "C" fn delete_object(context: *mut c_void, path: KernelNativeStringSliceV1) -> i32 {
-    guarded(|| {
-        DELETES.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: The caller retains context and readable path through callback return.
-        let (context, path) = unsafe { (context_ref(context)?, copy_path(path)?) };
-        let path = Path::parse(path).map_err(|_| KERNEL_NATIVE_STATUS_GENERIC)?;
-        runtime()?
-            .block_on(context.store.delete(&path))
-            .map_err(error_status)?;
-        Ok(())
+        unsafe { marshalling::put_result(&result, sink_context, sink) }
     })
 }
 
 unsafe extern "C" fn release(context: *mut c_void) {
     guarded(|| {
         if !context.is_null() {
+            if !context.cast::<ProviderContext>().is_aligned() {
+                return Err(KERNEL_NATIVE_STATUS_GENERIC);
+            }
             // SAFETY: Only the final owner calls release, once, with this provider's allocation.
             let context = unsafe { Box::from_raw(context.cast::<ProviderContext>()) };
             RELEASES.fetch_add(1, Ordering::SeqCst);
@@ -424,18 +437,6 @@ unsafe fn copy_bytes(value: KernelNativeByteSliceV1) -> Result<Vec<u8>, i32> {
     }
     // SAFETY: The ABI caller guarantees one readable allocation of at least len bytes.
     Ok(unsafe { slice::from_raw_parts(value.ptr, value.len) }.to_vec())
-}
-
-fn borrowed_metadata(metadata: &ObjectMeta) -> KernelNativeObjectMetaV1 {
-    let location = metadata.location.as_ref();
-    KernelNativeObjectMetaV1 {
-        location: KernelNativeStringSliceV1 {
-            ptr: location.as_ptr().cast(),
-            len: location.len(),
-        },
-        size: metadata.size,
-        last_modified_unix_ms: metadata.last_modified.timestamp_millis(),
-    }
 }
 
 fn sink_status(status: i32) -> Result<(), i32> {
@@ -492,12 +493,7 @@ fn native_get_options(options: KernelNativeGetOptionsV3) -> Result<GetOptions, i
 }
 
 fn error_status(error: object_store::Error) -> i32 {
-    match error {
-        object_store::Error::NotFound { .. } => KERNEL_NATIVE_STATUS_NOT_FOUND,
-        object_store::Error::AlreadyExists { .. } => KERNEL_NATIVE_STATUS_ALREADY_EXISTS,
-        object_store::Error::NotSupported { .. } => KERNEL_NATIVE_STATUS_NOT_SUPPORTED,
-        _ => KERNEL_NATIVE_STATUS_GENERIC,
-    }
+    operations::error_status_ref(&error)
 }
 
 #[cfg(test)]
@@ -512,8 +508,8 @@ mod tests {
     use async_trait::async_trait;
     use futures::{Stream, StreamExt};
     use object_store::{
-        CopyOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions, PutPayload,
-        PutResult,
+        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectStoreExt, PutMultipartOptions,
+        PutPayload, PutResult,
     };
 
     use super::*;
@@ -529,6 +525,8 @@ mod tests {
         location: String,
         size: u64,
         timestamp: i64,
+        e_tag: Option<String>,
+        version: Option<String>,
     }
 
     #[derive(Default)]
@@ -538,7 +536,7 @@ mod tests {
         ranges: Vec<Range<u64>>,
     }
 
-    struct Fixture(KernelNativeObjectStoreDescriptorV3);
+    struct Fixture(KernelNativeObjectStoreDescriptorV4);
 
     struct Cursor(*mut c_void);
 
@@ -596,7 +594,7 @@ mod tests {
                 self.0.get.unwrap()(
                     self.0.context,
                     string(path),
-                    options,
+                    v4_get(options),
                     ptr::from_mut(&mut capture).cast(),
                     capture_get,
                 )
@@ -639,12 +637,12 @@ mod tests {
 
         fn put(&self, path: &str, body: &[u8], mode: u32) -> i32 {
             // SAFETY: The fixture retains context and all input bytes through synchronous return.
-            unsafe { self.0.put.unwrap()(self.0.context, string(path), bytes(body), mode) }
+            unsafe { put(self.0.context, string(path), bytes(body), mode) }
         }
 
         fn delete(&self, path: &str) -> i32 {
             // SAFETY: The fixture retains context and the readable path through return.
-            unsafe { self.0.delete_object.unwrap()(self.0.context, string(path)) }
+            unsafe { delete_object(self.0.context, string(path)) }
         }
     }
 
@@ -669,25 +667,126 @@ mod tests {
         }
     }
 
+    fn v4_get(base: KernelNativeGetOptionsV3) -> KernelNativeGetOptionsV4 {
+        KernelNativeGetOptionsV4 {
+            base,
+            if_match: optional_string(None),
+            if_none_match: optional_string(None),
+            version: optional_string(None),
+            time_flags: 0,
+            modified_nanos: 0,
+            modified_seconds: 0,
+            unmodified_seconds: 0,
+            unmodified_nanos: 0,
+        }
+    }
+
+    fn write_options(mode: u32) -> KernelNativeWriteOptionsV4 {
+        KernelNativeWriteOptionsV4 {
+            mode,
+            e_tag: optional_string(None),
+            version: optional_string(None),
+            tags: ptr::null(),
+            tags_len: 0,
+            attributes: ptr::null(),
+            attributes_len: 0,
+        }
+    }
+
+    unsafe fn get(
+        context: *mut c_void,
+        path: KernelNativeStringSliceV1,
+        options: KernelNativeGetOptionsV3,
+        sink_context: *mut c_void,
+        sink: unsafe extern "C" fn(
+            *mut c_void,
+            *const KernelNativeObjectMetaV4,
+            KernelNativeByteSliceV1,
+            u64,
+            u64,
+            *const KernelNativeKeyValueV4,
+            usize,
+        ) -> i32,
+    ) -> i32 {
+        unsafe { super::get(context, path, v4_get(options), sink_context, sink) }
+    }
+
+    unsafe extern "C" fn ignore_put(
+        _context: *mut c_void,
+        _result: *const KernelNativePutResultV4,
+    ) -> i32 {
+        0
+    }
+
+    unsafe fn put(
+        context: *mut c_void,
+        path: KernelNativeStringSliceV1,
+        body: KernelNativeByteSliceV1,
+        mode: u32,
+    ) -> i32 {
+        unsafe {
+            super::put(
+                context,
+                path,
+                body,
+                write_options(mode),
+                ptr::from_mut(&mut 0_u8).cast(),
+                ignore_put,
+            )
+        }
+    }
+
+    unsafe extern "C" fn capture_delete_status(
+        context: *mut c_void,
+        _path: KernelNativeStringSliceV1,
+        status: i32,
+    ) -> i32 {
+        unsafe { *context.cast::<i32>() = status };
+        0
+    }
+
+    unsafe fn delete_object(context: *mut c_void, path: KernelNativeStringSliceV1) -> i32 {
+        let mut item_status = 0;
+        let status = unsafe {
+            operations::delete_batch(
+                context,
+                &path,
+                1,
+                ptr::from_mut(&mut item_status).cast(),
+                capture_delete_status,
+            )
+        };
+        if status == 0 {
+            item_status
+        } else {
+            status
+        }
+    }
+
     unsafe fn own_metadata(
-        metadata: *const KernelNativeObjectMetaV1,
+        metadata: *const KernelNativeObjectMetaV4,
     ) -> Result<OwnedMetadata, i32> {
         // SAFETY: The provider supplies readable metadata and UTF-8 until the sink returns.
         let metadata = unsafe { metadata.as_ref() }.ok_or(KERNEL_NATIVE_STATUS_GENERIC)?;
+        let base = &metadata.base;
         Ok(OwnedMetadata {
             // SAFETY: The metadata path remains readable for the synchronous copy.
-            location: unsafe { copy_string(metadata.location) }?,
-            size: metadata.size,
-            timestamp: metadata.last_modified_unix_ms,
+            location: unsafe { copy_string(base.location) }?,
+            size: base.size,
+            timestamp: base.last_modified_unix_ms,
+            e_tag: unsafe { marshalling::copy_optional(metadata.e_tag, &mut 0) }?,
+            version: unsafe { marshalling::copy_optional(metadata.version, &mut 0) }?,
         })
     }
 
     unsafe extern "C" fn capture_get(
         context: *mut c_void,
-        metadata: *const KernelNativeObjectMetaV1,
+        metadata: *const KernelNativeObjectMetaV4,
         body: KernelNativeByteSliceV1,
         start: u64,
         end: u64,
+        _attributes: *const KernelNativeKeyValueV4,
+        _attributes_len: usize,
     ) -> i32 {
         guarded(|| {
             // SAFETY: Fixture::get exclusively lends its capture and provider output for this call.
@@ -704,7 +803,7 @@ mod tests {
 
     unsafe extern "C" fn capture_list(
         context: *mut c_void,
-        metadata: *const KernelNativeObjectMetaV1,
+        metadata: *const KernelNativeObjectMetaV4,
     ) -> i32 {
         guarded(|| {
             // SAFETY: Fixture::list exclusively lends its capture and provider output for this
@@ -719,17 +818,19 @@ mod tests {
 
     unsafe extern "C" fn reject_get(
         _context: *mut c_void,
-        _metadata: *const KernelNativeObjectMetaV1,
+        _metadata: *const KernelNativeObjectMetaV4,
         _body: KernelNativeByteSliceV1,
         _start: u64,
         _end: u64,
+        _attributes: *const KernelNativeKeyValueV4,
+        _attributes_len: usize,
     ) -> i32 {
         KERNEL_NATIVE_STATUS_NOT_FOUND
     }
 
     unsafe extern "C" fn reject_list(
         context: *mut c_void,
-        _metadata: *const KernelNativeObjectMetaV1,
+        _metadata: *const KernelNativeObjectMetaV4,
     ) -> i32 {
         guarded(|| {
             // SAFETY: The test passes an exclusively writable counter, live until callback return.
@@ -786,18 +887,18 @@ mod tests {
     }
 
     #[test]
-    fn memory_factory_populates_v3_descriptor_and_full_get_list_copy_seeded_table() {
+    fn memory_factory_populates_v4_descriptor_and_full_get_list_copy_seeded_table() {
         let _serial = TEST_LOCK.lock().unwrap();
         let fixture = Fixture::memory();
-        assert_eq!(fixture.0.abi_version, KERNEL_NATIVE_STORE_ABI_V3);
+        assert_eq!(fixture.0.abi_version, KERNEL_NATIVE_STORE_ABI_V4);
         assert_eq!(fixture.0.struct_size, prototype_descriptor_size());
         assert_eq!(
             fixture.0.struct_size as usize,
-            size_of::<KernelNativeObjectStoreDescriptorV3>()
+            size_of::<KernelNativeObjectStoreDescriptorV4>()
         );
         assert_eq!(size_of::<KernelNativeGetOptionsV3>(), 24);
         if size_of::<usize>() == 8 {
-            assert_eq!(fixture.0.struct_size, 72);
+            assert_eq!(fixture.0.struct_size, 160);
         }
         assert!(!fixture.0.context.is_null());
         assert!(fixture.0.get.is_some() && fixture.0.release.is_some());
@@ -806,7 +907,7 @@ mod tests {
                 && fixture.0.list_next.is_some()
                 && fixture.0.list_close.is_some()
         );
-        assert!(fixture.0.put.is_some() && fixture.0.delete_object.is_some());
+        assert!(fixture.0.put.is_some() && fixture.0.delete_batch.is_some());
         let baseline = prototype_callback_count();
         let (status, full) = fixture.get(INITIAL_PATH);
         assert_eq!(status, KERNEL_NATIVE_STATUS_OK);
@@ -1041,10 +1142,25 @@ mod tests {
                 4
             );
         }
-        assert_eq!(fixture.put(INITIAL_PATH, b"", 2), 4);
+        assert_eq!(fixture.put(INITIAL_PATH, b"", 99), 4);
         let (status, missing) = fixture.get("missing");
         assert_eq!(status, KERNEL_NATIVE_STATUS_NOT_FOUND);
         assert!(missing.metadata.is_empty() && missing.bodies.is_empty());
+    }
+
+    #[test]
+    fn factories_reject_misaligned_output_before_allocation() {
+        let output = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+        unsafe {
+            assert_eq!(
+                prototype_create_memory(output),
+                KERNEL_NATIVE_STATUS_GENERIC
+            );
+            assert_eq!(
+                prototype_create_azure(string("http://127.0.0.1:1"), output),
+                KERNEL_NATIVE_STATUS_GENERIC
+            );
+        }
     }
 
     #[test]
@@ -1145,7 +1261,21 @@ mod tests {
         inner: InMemory,
         gets: Mutex<Vec<GetOptions>>,
         put_modes: Mutex<Vec<PutMode>>,
+        put_options: Mutex<Vec<PutOptions>>,
+        range_requests: Mutex<Vec<(Path, Vec<Range<u64>>)>>,
+        range_results: Option<Vec<Bytes>>,
         deletes: AtomicU64,
+        delete_inputs: Arc<Mutex<Vec<Path>>>,
+        delete_case: &'static str,
+        copies: Mutex<Vec<(Path, Path, CopyOptions)>>,
+        renames: Mutex<Vec<(Path, Path, object_store::RenameOptions)>>,
+        delimiter_requests: Mutex<Vec<Option<Path>>>,
+        delimiter_override: Option<ListResult>,
+        multipart_options: Mutex<Vec<(Path, PutMultipartOptions)>>,
+        upload_probe: Option<Arc<v4::UploadProbe>>,
+        multipart_unimplemented: bool,
+        response_version: bool,
+        response_attributes: Option<object_store::Attributes>,
         list_requests: Mutex<Vec<(Option<Path>, Option<Path>)>>,
         polls: Arc<AtomicU64>,
         stream_drops: Arc<AtomicU64>,
@@ -1239,6 +1369,12 @@ mod tests {
             self.gets.lock().unwrap().push(options.clone());
             let full_head = options.head && options.range.is_none();
             let mut result = self.inner.get_opts(path, options).await?;
+            if self.response_version {
+                result.meta.version = Some(String::new());
+            }
+            if let Some(attributes) = &self.response_attributes {
+                result.attributes = attributes.clone();
+            }
             if self.large_metadata {
                 result.meta.size = MAX_BODY_BYTES as u64 + 1;
                 if full_head {
@@ -1265,7 +1401,27 @@ mod tests {
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
             self.put_modes.lock().unwrap().push(options.mode.clone());
-            self.inner.put_opts(path, payload, options).await
+            self.put_options.lock().unwrap().push(options.clone());
+            let mut result = self.inner.put_opts(path, payload, options).await?;
+            if self.response_version {
+                result.version = Some(String::new());
+            }
+            Ok(result)
+        }
+
+        async fn get_ranges(
+            &self,
+            path: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.range_requests
+                .lock()
+                .unwrap()
+                .push((path.clone(), ranges.to_vec()));
+            if let Some(results) = &self.range_results {
+                return Ok(results.clone());
+            }
+            self.inner.get_ranges(path, ranges).await
         }
 
         fn delete_stream(
@@ -1273,6 +1429,41 @@ mod tests {
             paths: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
             self.deletes.fetch_add(1, Ordering::SeqCst);
+            let inputs = self.delete_inputs.clone();
+            let paths = paths
+                .map(move |result| {
+                    if let Ok(path) = &result {
+                        inputs.lock().unwrap().push(path.clone());
+                    }
+                    result
+                })
+                .boxed();
+            if !self.delete_case.is_empty() {
+                let case = self.delete_case;
+                return futures::stream::once(async move {
+                    let paths = paths.try_collect::<Vec<_>>().await.unwrap();
+                    let error = object_store::Error::Generic {
+                        store: "StoreSpy",
+                        source: "aggregate delete failure".into(),
+                    };
+                    let results = if case == "aggregate" {
+                        vec![Ok(paths[0].clone()), Err(error)]
+                    } else {
+                        vec![
+                            Err(object_store::Error::NotFound {
+                                path: paths[0].to_string(),
+                                source: "item missing".into(),
+                            }),
+                            Ok(paths[1].clone()),
+                            Err(error),
+                            Ok(paths[2].clone()),
+                        ]
+                    };
+                    futures::stream::iter(results)
+                })
+                .flatten()
+                .boxed();
+            }
             self.inner.delete_stream(paths)
         }
 
@@ -1296,13 +1487,38 @@ mod tests {
             path: &Path,
             options: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.inner.put_multipart_opts(path, options).await
+            self.multipart_options
+                .lock()
+                .unwrap()
+                .push((path.clone(), options.clone()));
+            if self.multipart_unimplemented {
+                return Err(object_store::Error::NotImplemented {
+                    operation: "put_multipart_opts".into(),
+                    implementer: "StoreSpy".into(),
+                });
+            }
+            let inner = self.inner.put_multipart_opts(path, options).await?;
+            match &self.upload_probe {
+                Some(probe) => Ok(Box::new(v4::SpyUpload::new(inner, probe.clone()))),
+                None => Ok(inner),
+            }
         }
 
         async fn list_with_delimiter(
             &self,
             prefix: Option<&Path>,
         ) -> object_store::Result<ListResult> {
+            self.delimiter_requests
+                .lock()
+                .unwrap()
+                .push(prefix.cloned());
+            if let Some(result) = &self.delimiter_override {
+                return Ok(ListResult {
+                    objects: result.objects.clone(),
+                    common_prefixes: result.common_prefixes.clone(),
+                    extensions: Default::default(),
+                });
+            }
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -1312,7 +1528,24 @@ mod tests {
             to: &Path,
             options: CopyOptions,
         ) -> object_store::Result<()> {
+            self.copies
+                .lock()
+                .unwrap()
+                .push((from.clone(), to.clone(), options.clone()));
             self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::RenameOptions,
+        ) -> object_store::Result<()> {
+            self.renames
+                .lock()
+                .unwrap()
+                .push((from.clone(), to.clone(), options.clone()));
+            self.inner.rename_opts(from, to, options).await
         }
     }
 
@@ -1638,4 +1871,6 @@ mod tests {
         drop(cursor);
         assert_eq!(store.stream_drops.load(Ordering::SeqCst), 1);
     }
+
+    include!("provider/v4_tests.rs");
 }

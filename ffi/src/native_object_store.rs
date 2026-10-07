@@ -1,14 +1,18 @@
-//! [`ObjectStore`] forwarding through an independent provider's v3 C descriptor.
+//! [`ObjectStore`] forwarding through an independent provider's v4 C descriptor.
 //!
 //! The provider owns storage, authentication, runtime, and allocations. Kernel copies borrowed
 //! sink output and retains the adopted context until the last handle, builder, engine, stream,
 //! or blocking operation releases it. Synchronous I/O callbacks run on Tokio blocking workers;
 //! release can run on any thread. Dropping an async operation does not cancel a native call.
 //!
-//! GET, HEAD, ranges, atomic Create/Overwrite PUT, DELETE and native cursor listing are forwarded.
-//! Byte payloads are limited to 64 MiB and paths to 64 KiB. Listing batches have at most 128
+//! Native GET conditions, metadata, ranges, writes, delete batches, copy/rename, delimiter and
+//! cursor listing, and multipart operations are forwarded without replacing provider policy.
+//! Request extensions are unsupported; response extensions do not cross the DLL boundary.
+//! Borrowed output and payloads are bounded to 64 MiB, strings to 64 KiB, arrays to 4096.
+//! Listing and deletion batches have at most 128
 //! entries, without a total listing limit or ordering policy. Both modules remain loaded through
-//! final release.
+//! final release. Multipart drop closes native handles only: callers must explicitly abort
+//! unfinished uploads for backend cleanup (notably S3). This is not unbounded full API parity.
 
 use std::ffi::c_void;
 use std::fmt;
@@ -22,9 +26,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{
-    self, Attributes, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange, GetResult,
-    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, TagSet,
+    self, Attributes, CopyMode, CopyOptions, Error as ObjectStoreError, GetOptions, GetRange,
+    GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, RenameTargetMode,
+    Result as ObjectStoreResult, TagSet,
 };
 use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -34,6 +39,14 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::error::{AllocateErrorFn, ExternResult, IntoExternResult};
 use crate::handle::Handle;
+
+#[cfg(all(test, target_os = "windows"))]
+mod cross_dll_tests;
+mod marshalling;
+mod multipart;
+use marshalling::{
+    copy_attributes, copy_optional_string, meta_bytes, OwnedWriteOptions, PutSinkState,
+};
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 64 * 1024;
@@ -50,7 +63,7 @@ pub struct NativeObjectStore {
 pub struct SharedNativeObjectStore;
 
 struct NativeContext {
-    descriptor: KernelNativeObjectStoreDescriptorV3,
+    descriptor: KernelNativeObjectStoreDescriptorV4,
 }
 
 struct GetSinkState {
@@ -58,7 +71,7 @@ struct GetSinkState {
     head: bool,
     range: Option<GetRange>,
     called: bool,
-    output: Option<(ObjectMeta, Bytes, Range<u64>)>,
+    output: Option<(ObjectMeta, Bytes, Range<u64>, Attributes)>,
     error: Option<ObjectStoreError>,
 }
 
@@ -66,6 +79,7 @@ struct ListSinkState {
     prefix: Path,
     offset: Option<Path>,
     objects: Vec<ObjectMeta>,
+    bytes: usize,
     error: Option<ObjectStoreError>,
 }
 
@@ -125,13 +139,14 @@ impl ObjectStore for NativeObjectStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        let mode = validate_put_options(&options)?;
+        let options = OwnedWriteOptions::from_put(options)?;
         let length = payload.iter().try_fold(0usize, |length, chunk| {
             length
                 .checked_add(chunk.len())
                 .filter(|length| *length <= MAX_BODY_BYTES)
                 .ok_or_else(|| not_supported("PUT payloads larger than 64 MiB"))
         })?;
+        options.validate_payload(length)?;
         let path = location.to_string();
         validate_input_path(&path)?;
         let store = self.clone();
@@ -140,31 +155,49 @@ impl ObjectStore for NativeObjectStore {
             for chunk in payload {
                 bytes.extend_from_slice(&chunk);
             }
-            store.put_sync(&path, &bytes, mode)
+            store.put_sync(&path, &bytes, &options)
         })
-        .await?;
-        Ok(object_store::delta_kernel_compat::empty_put_result())
+        .await
     }
 
     async fn put_multipart_opts(
         &self,
-        _location: &Path,
-        _options: PutMultipartOptions,
+        location: &Path,
+        options: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        Err(not_supported("multipart upload"))
+        let path = location.to_string();
+        validate_input_path(&path)?;
+        let options = OwnedWriteOptions::from_multipart(options)?;
+        let store = self.clone();
+        run_blocking(move || multipart::NativeMultipart::open(store, path, options))
+            .await
+            .map(|upload| Box::new(upload) as Box<dyn MultipartUpload>)
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
         let path = location.to_string();
         let store = self.clone();
-        let (meta, body, range) = run_blocking(move || store.get_sync(&path, &options)).await?;
+        let (meta, body, range, attributes) =
+            run_blocking(move || store.get_sync(&path, &options)).await?;
         let payload = GetResultPayload::Stream(stream::once(std::future::ready(Ok(body))).boxed());
         Ok(object_store::delta_kernel_compat::get_result(
-            payload,
-            meta,
-            range,
-            Attributes::new(),
+            payload, meta, range, attributes,
         ))
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> ObjectStoreResult<Vec<Bytes>> {
+        let path = location.to_string();
+        validate_input_path(&path)?;
+        if ranges.len() > KERNEL_NATIVE_MAX_COLLECTION {
+            return Err(not_supported("more than 4096 ranges"));
+        }
+        let ranges = ranges.to_vec();
+        let store = self.clone();
+        run_blocking(move || store.get_ranges_sync(&path, &ranges)).await
     }
 
     fn delete_stream(
@@ -173,17 +206,30 @@ impl ObjectStore for NativeObjectStore {
     ) -> BoxStream<'static, ObjectStoreResult<Path>> {
         let store = self.clone();
         locations
-            .then(move |location| {
+            .ready_chunks(MAX_LIST_ITEMS)
+            .then(move |chunk| {
                 let store = store.clone();
                 async move {
-                    let location = location?;
-                    run_blocking(move || {
-                        store.delete_sync(location.as_ref())?;
-                        Ok(location)
-                    })
-                    .await
+                    let mut output = Vec::new();
+                    let mut run = Vec::new();
+                    for location in chunk {
+                        let location = location.and_then(|path| {
+                            validate_input_path(path.as_ref())?;
+                            Ok(path)
+                        });
+                        match location {
+                            Ok(path) => run.push(path),
+                            Err(error) => {
+                                marshalling::flush_deletes(&store, &mut run, &mut output).await;
+                                output.push(Err(error));
+                            }
+                        }
+                    }
+                    marshalling::flush_deletes(&store, &mut run, &mut output).await;
+                    stream::iter(output)
                 }
             })
+            .flatten()
             .boxed()
     }
 
@@ -199,17 +245,42 @@ impl ObjectStore for NativeObjectStore {
         self.list_stream(prefix, Some(offset))
     }
 
-    async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        Err(not_supported("delimiter listing"))
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        let prefix = prefix.map(ToString::to_string).unwrap_or_default();
+        let store = self.clone();
+        run_blocking(move || store.delimiter_sync(&prefix)).await
     }
 
     async fn copy_opts(
         &self,
-        _from: &Path,
-        _to: &Path,
-        _options: CopyOptions,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
     ) -> ObjectStoreResult<()> {
-        Err(not_supported("copy"))
+        if !options.extensions.is_empty() {
+            return Err(not_supported("COPY request extensions"));
+        }
+        let mode = match options.mode {
+            CopyMode::Overwrite => 0,
+            CopyMode::Create => 1,
+        };
+        self.transfer(from, to, mode, false).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> ObjectStoreResult<()> {
+        if !options.extensions.is_empty() {
+            return Err(not_supported("RENAME request extensions"));
+        }
+        let mode = match options.target_mode {
+            RenameTargetMode::Overwrite => 0,
+            RenameTargetMode::Create => 1,
+        };
+        self.transfer(from, to, mode, true).await
     }
 }
 
@@ -217,7 +288,7 @@ impl NativeObjectStore {
     /// # Safety
     ///
     /// The descriptor and provider must satisfy [`get_native_object_store`]'s contract.
-    unsafe fn adopt(descriptor: *const KernelNativeObjectStoreDescriptorV3) -> KernelResult<Self> {
+    unsafe fn adopt(descriptor: *const KernelNativeObjectStoreDescriptorV4) -> KernelResult<Self> {
         let invalid = || KernelError::generic("invalid native object store descriptor");
         if descriptor.is_null() {
             return Err(invalid());
@@ -225,8 +296,8 @@ impl NativeObjectStore {
         // SAFETY: only the two readable header fields are inspected before layout validation.
         let abi_version = unsafe { descriptor.cast::<u32>().read_unaligned() };
         let struct_size = unsafe { descriptor.cast::<u32>().add(1).read_unaligned() };
-        if abi_version != KERNEL_NATIVE_STORE_ABI_V3
-            || struct_size as usize != size_of::<KernelNativeObjectStoreDescriptorV3>()
+        if abi_version != KERNEL_NATIVE_STORE_ABI_V4
+            || struct_size as usize != size_of::<KernelNativeObjectStoreDescriptorV4>()
             || !descriptor.is_aligned()
         {
             return Err(invalid());
@@ -235,11 +306,22 @@ impl NativeObjectStore {
         let descriptor = unsafe { *descriptor };
         if descriptor.context.is_null()
             || descriptor.get.is_none()
+            || descriptor.get_ranges.is_none()
             || descriptor.list_open.is_none()
             || descriptor.list_next.is_none()
             || descriptor.list_close.is_none()
+            || descriptor.list_delimiter.is_none()
             || descriptor.put.is_none()
-            || descriptor.delete_object.is_none()
+            || descriptor.delete_batch.is_none()
+            || descriptor.copy.is_none()
+            || descriptor.rename.is_none()
+            || descriptor.multipart_open.is_none()
+            || descriptor.multipart_part_open.is_none()
+            || descriptor.multipart_part_wait.is_none()
+            || descriptor.multipart_part_close.is_none()
+            || descriptor.multipart_complete.is_none()
+            || descriptor.multipart_abort.is_none()
+            || descriptor.multipart_close.is_none()
             || descriptor.release.is_none()
         {
             return Err(invalid());
@@ -253,7 +335,7 @@ impl NativeObjectStore {
         &self,
         path: &str,
         options: &GetOptions,
-    ) -> ObjectStoreResult<(ObjectMeta, Bytes, Range<u64>)> {
+    ) -> ObjectStoreResult<(ObjectMeta, Bytes, Range<u64>, Attributes)> {
         validate_input_path(path)?;
         let request = validate_get_options(options)?;
         let descriptor = &self.context.descriptor;
@@ -288,13 +370,18 @@ impl NativeObjectStore {
             .ok_or_else(|| generic_error("native GET did not invoke its sink exactly once"))
     }
 
-    fn put_sync(&self, path: &str, bytes: &[u8], mode: u32) -> ObjectStoreResult<()> {
+    fn put_sync(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        options: &OwnedWriteOptions,
+    ) -> ObjectStoreResult<PutResult> {
         let descriptor = &self.context.descriptor;
         let callback = descriptor
             .put
             .ok_or_else(|| generic_error("native PUT callback is missing"))?;
-        // SAFETY: the store reference, path and copied payload live through callback return.
-        let status = unsafe {
+        let mut state = PutSinkState::default();
+        let status = options.with_view(|options| unsafe {
             callback(
                 descriptor.context,
                 string_slice(path),
@@ -302,23 +389,47 @@ impl NativeObjectStore {
                     ptr: bytes.as_ptr(),
                     len: bytes.len(),
                 },
-                mode,
+                options,
+                (&mut state as *mut PutSinkState).cast(),
+                marshalling::put_sink,
             )
-        };
-        check_status(status, path)
+        });
+        state.finish(status, path)
     }
 
-    fn delete_sync(&self, path: &str) -> ObjectStoreResult<()> {
-        validate_input_path(path)?;
-        let descriptor = &self.context.descriptor;
-        let callback = descriptor
-            .delete_object
-            .ok_or_else(|| generic_error("native DELETE callback is missing"))?;
-        // SAFETY: the retained context and borrowed path live through callback return.
-        check_status(
-            unsafe { callback(descriptor.context, string_slice(path)) },
-            path,
-        )
+    async fn transfer(
+        &self,
+        from: &Path,
+        to: &Path,
+        mode: u32,
+        rename: bool,
+    ) -> ObjectStoreResult<()> {
+        let from = from.to_string();
+        let to = to.to_string();
+        validate_input_path(&from)?;
+        validate_input_path(&to)?;
+        let store = self.clone();
+        run_blocking(move || {
+            let descriptor = &store.context.descriptor;
+            let callback = if rename {
+                descriptor.rename
+            } else {
+                descriptor.copy
+            }
+            .ok_or_else(|| generic_error("native transfer callback is missing"))?;
+            check_status(
+                unsafe {
+                    callback(
+                        descriptor.context,
+                        string_slice(&from),
+                        string_slice(&to),
+                        mode,
+                    )
+                },
+                &to,
+            )
+        })
+        .await
     }
 
     fn list_stream(
@@ -413,6 +524,7 @@ impl NativeListing {
             prefix: self.prefix.clone(),
             offset: self.offset.clone(),
             objects: Vec::new(),
+            bytes: 0,
             error: None,
         };
         let mut has_more = u32::MAX;
@@ -440,7 +552,7 @@ impl NativeListing {
     }
 }
 
-/// Adopt a forwarding v3 descriptor and return an owned shared handle.
+/// Adopt a forwarding v4 descriptor and return an owned shared handle.
 ///
 /// `descriptor` is borrowed only during this call and copied on success. Only success transfers
 /// ownership of its provider context; Kernel then calls `release` exactly once after its final
@@ -451,12 +563,13 @@ impl NativeListing {
 /// # Errors
 ///
 /// Returns a generic Kernel error for null descriptors, unknown versions, non-exact sizes,
-/// misaligned v3 storage, null context, or any missing callback. Versions one and two are rejected.
+/// misaligned v4 storage, null context, or any missing callback. Versions one, two and three are
+/// rejected.
 ///
 /// # Safety
 ///
 /// A non-null descriptor must expose two readable initialized `u32` header fields. When those
-/// fields claim the exact v3 layout, it must also expose the full initialized descriptor. Invalid
+/// fields claim the exact v4 layout, it must also expose the full initialized descriptor. Invalid
 /// non-null pointers are caller violations, not recoverable errors. After successful adoption,
 /// the context must not be freed or adopted again by the caller. All callbacks must be thread
 /// safe, support concurrent calls, never unwind, and follow the ABI sink/input lifetime contract.
@@ -465,7 +578,7 @@ impl NativeListing {
 /// stay loaded until all handles, engines, streams, and native calls have completed.
 #[no_mangle]
 pub unsafe extern "C" fn get_native_object_store(
-    descriptor: *const KernelNativeObjectStoreDescriptorV3,
+    descriptor: *const KernelNativeObjectStoreDescriptorV4,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<SharedNativeObjectStore>> {
     unsafe { NativeObjectStore::adopt(descriptor) }
@@ -537,25 +650,55 @@ fn check_status(status: i32, path: &str) -> ObjectStoreResult<()> {
         KERNEL_NATIVE_STATUS_NOT_SUPPORTED => {
             Err(not_supported("the requested provider operation"))
         }
+        KERNEL_NATIVE_STATUS_PRECONDITION => Err(ObjectStoreError::Precondition {
+            path: path.to_string(),
+            source: "native object precondition failed".into(),
+        }),
+        KERNEL_NATIVE_STATUS_NOT_MODIFIED => Err(ObjectStoreError::NotModified {
+            path: path.to_string(),
+            source: "native object not modified".into(),
+        }),
+        KERNEL_NATIVE_STATUS_NOT_IMPLEMENTED => Err(ObjectStoreError::NotImplemented {
+            operation: "native provider operation".to_string(),
+            implementer: "NativeObjectStore".to_string(),
+        }),
         _ => Err(generic_error("native object store callback failed")),
     }
 }
 
-fn validate_get_options(options: &GetOptions) -> ObjectStoreResult<KernelNativeGetOptionsV3> {
-    if options.version.is_some()
-        || options.if_match.is_some()
-        || options.if_none_match.is_some()
-        || options.if_modified_since.is_some()
-        || options.if_unmodified_since.is_some()
-        || !options.extensions.is_empty()
-    {
-        return Err(not_supported(
-            "versioned/conditional reads or request extensions",
-        ));
+fn validate_get_options(options: &GetOptions) -> ObjectStoreResult<KernelNativeGetOptionsV4> {
+    if !options.extensions.is_empty() {
+        return Err(not_supported("GET request extensions"));
     }
-    let mut request = KernelNativeGetOptionsV3 {
-        head: u32::from(options.head),
-        ..Default::default()
+    for value in [&options.version, &options.if_match, &options.if_none_match]
+        .into_iter()
+        .flatten()
+    {
+        validate_input_path(value)?;
+    }
+    for time in [options.if_modified_since, options.if_unmodified_since]
+        .into_iter()
+        .flatten()
+    {
+        if time.timestamp_subsec_nanos() >= 1_000_000_000 {
+            return Err(not_supported("GET leap-second timestamps"));
+        }
+    }
+    let modified = options.if_modified_since;
+    let unmodified = options.if_unmodified_since;
+    let mut request = KernelNativeGetOptionsV4 {
+        base: KernelNativeGetOptionsV3 {
+            head: u32::from(options.head),
+            ..Default::default()
+        },
+        if_match: marshalling::optional_string_slice(options.if_match.as_deref()),
+        if_none_match: marshalling::optional_string_slice(options.if_none_match.as_deref()),
+        version: marshalling::optional_string_slice(options.version.as_deref()),
+        time_flags: u32::from(modified.is_some()) | (u32::from(unmodified.is_some()) << 1),
+        modified_seconds: modified.map_or(0, |time| time.timestamp()),
+        modified_nanos: modified.map_or(0, |time| time.timestamp_subsec_nanos()),
+        unmodified_seconds: unmodified.map_or(0, |time| time.timestamp()),
+        unmodified_nanos: unmodified.map_or(0, |time| time.timestamp_subsec_nanos()),
     };
     if let Some(range) = &options.range {
         range
@@ -563,72 +706,61 @@ fn validate_get_options(options: &GetOptions) -> ObjectStoreResult<KernelNativeG
             .map_err(|_| generic_error("invalid requested GET range"))?;
         match range {
             GetRange::Bounded(range) => {
-                request.range_kind = 1;
-                request.start = range.start;
-                request.end = range.end;
+                request.base.range_kind = 1;
+                request.base.start = range.start;
+                request.base.end = range.end;
             }
             GetRange::Offset(start) => {
-                request.range_kind = 2;
-                request.start = *start;
+                request.base.range_kind = 2;
+                request.base.start = *start;
             }
             GetRange::Suffix(length) => {
-                request.range_kind = 3;
-                request.end = *length;
+                request.base.range_kind = 3;
+                request.base.end = *length;
             }
         }
     }
     Ok(request)
 }
 
-fn validate_put_options(options: &PutOptions) -> ObjectStoreResult<u32> {
-    if options.tags != TagSet::default()
-        || !options.attributes.is_empty()
-        || !options.extensions.is_empty()
-    {
-        return Err(not_supported("PUT tags, attributes or request extensions"));
-    }
-    match options.mode {
-        PutMode::Overwrite => Ok(KERNEL_NATIVE_PUT_OVERWRITE),
-        PutMode::Create => Ok(KERNEL_NATIVE_PUT_CREATE),
-        PutMode::Update(_) => Err(not_supported("conditional Update PUT")),
-    }
-}
-
-unsafe fn copy_meta(meta: *const KernelNativeObjectMetaV1) -> ObjectStoreResult<ObjectMeta> {
+unsafe fn copy_meta(meta: *const KernelNativeObjectMetaV4) -> ObjectStoreResult<ObjectMeta> {
     if meta.is_null() || !meta.is_aligned() {
         return Err(generic_error("invalid native object metadata pointer"));
     }
     // SAFETY: the provider promises initialized metadata valid throughout the sink call.
     let meta = unsafe { &*meta };
-    if meta.location.len == 0 || meta.location.len > MAX_PATH_BYTES || meta.location.ptr.is_null() {
+    let base = &meta.base;
+    if base.location.len == 0 || base.location.len > MAX_PATH_BYTES || base.location.ptr.is_null() {
         return Err(generic_error("invalid native object location slice"));
     }
     // SAFETY: the provider guarantees these bytes are readable through the sink return.
     let location =
-        unsafe { std::slice::from_raw_parts(meta.location.ptr.cast::<u8>(), meta.location.len) };
+        unsafe { std::slice::from_raw_parts(base.location.ptr.cast::<u8>(), base.location.len) };
     let location = std::str::from_utf8(location)
         .map_err(|_| generic_error("native object location is not UTF-8"))?;
     let path = Path::parse(location).map_err(|_| generic_error("invalid native object path"))?;
     if path.as_ref() != location {
         return Err(generic_error("native object path is not store-relative"));
     }
-    let last_modified = DateTime::<Utc>::from_timestamp_millis(meta.last_modified_unix_ms)
+    let last_modified = DateTime::<Utc>::from_timestamp_millis(base.last_modified_unix_ms)
         .ok_or_else(|| generic_error("invalid native object modification timestamp"))?;
     Ok(ObjectMeta {
         location: path,
-        size: meta.size,
+        size: base.size,
         last_modified,
-        e_tag: None,
-        version: None,
+        e_tag: unsafe { copy_optional_string(meta.e_tag) }?,
+        version: unsafe { copy_optional_string(meta.version) }?,
     })
 }
 
 unsafe extern "C" fn get_sink(
     context: *mut c_void,
-    meta: *const KernelNativeObjectMetaV1,
+    meta: *const KernelNativeObjectMetaV4,
     body: KernelNativeByteSliceV1,
     range_start: u64,
     range_end: u64,
+    attributes: *const KernelNativeKeyValueV4,
+    attributes_len: usize,
 ) -> i32 {
     // SAFETY: only get_sync supplies this live state, and the provider cannot retain the sink.
     let state = unsafe { &mut *context.cast::<GetSinkState>() };
@@ -676,7 +808,10 @@ unsafe extern "C" fn get_sink(
             // SAFETY: the provider guarantees readable bytes; the length is bounded above.
             Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(body.ptr, body.len) })
         };
-        Ok((meta, bytes, range))
+        let mut budget = body.len;
+        marshalling::charge(&mut budget, meta_bytes(&meta))?;
+        let attributes = unsafe { copy_attributes(attributes, attributes_len, &mut budget) }?;
+        Ok((meta, bytes, range, attributes))
     })();
     match output {
         Ok(output) => {
@@ -690,7 +825,7 @@ unsafe extern "C" fn get_sink(
     }
 }
 
-unsafe extern "C" fn list_sink(context: *mut c_void, meta: *const KernelNativeObjectMetaV1) -> i32 {
+unsafe extern "C" fn list_sink(context: *mut c_void, meta: *const KernelNativeObjectMetaV4) -> i32 {
     // SAFETY: only next_sync supplies this live state; sink calls cannot overlap or escape.
     let state = unsafe { &mut *context.cast::<ListSinkState>() };
     if state.error.is_some() {
@@ -701,6 +836,7 @@ unsafe extern "C" fn list_sink(context: *mut c_void, meta: *const KernelNativeOb
             return Err(generic_error("native LIST exceeded its batch limit"));
         }
         let meta = unsafe { copy_meta(meta) }?;
+        marshalling::charge(&mut state.bytes, meta_bytes(&meta))?;
         if !meta.location.prefix_matches(&state.prefix)
             || state
                 .offset
@@ -753,6 +889,21 @@ mod tests {
         delete_requests: Mutex<Vec<String>>,
         list_requests: Mutex<Vec<(String, String)>>,
         released: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        range_requests: Mutex<Vec<Vec<Range<u64>>>>,
+        range_paths: Mutex<Vec<String>>,
+        delimiter_requests: Mutex<Vec<String>>,
+        upload_paths: Mutex<Vec<String>>,
+        delete_batches: Mutex<Vec<usize>>,
+        transfers: Mutex<Vec<(bool, String, String, u32)>>,
+        write_options: Mutex<Vec<WriteRequest>>,
+        get_conditions: Mutex<Vec<GetConditions>>,
+        upload_opens: AtomicUsize,
+        upload_closes: AtomicUsize,
+        part_closes: AtomicUsize,
+        part_waits: Mutex<Vec<usize>>,
+        parts: Mutex<Vec<Vec<u8>>>,
+        completes: AtomicUsize,
+        aborts: AtomicUsize,
     }
 
     struct CallGate {
@@ -806,6 +957,9 @@ mod tests {
         gate_after: usize,
         status: i32,
         gate: Option<Arc<CallGate>>,
+        metadata: bool,
+        v4_case: &'static str,
+        multipart_gate: Option<Arc<CallGate>>,
     }
 
     impl Default for Provider {
@@ -824,22 +978,36 @@ mod tests {
                 gate_after: 0,
                 status: KERNEL_NATIVE_STATUS_OK,
                 gate: None,
+                metadata: false,
+                v4_case: "",
+                multipart_gate: None,
             }
         }
     }
 
-    fn descriptor_for(provider: Provider) -> (KernelNativeObjectStoreDescriptorV3, Arc<Probe>) {
+    fn descriptor_for(provider: Provider) -> (KernelNativeObjectStoreDescriptorV4, Arc<Probe>) {
         let probe = provider.probe.clone();
-        let descriptor = KernelNativeObjectStoreDescriptorV3 {
-            abi_version: KERNEL_NATIVE_STORE_ABI_V3,
-            struct_size: size_of::<KernelNativeObjectStoreDescriptorV3>() as u32,
+        let descriptor = KernelNativeObjectStoreDescriptorV4 {
+            abi_version: KERNEL_NATIVE_STORE_ABI_V4,
+            struct_size: size_of::<KernelNativeObjectStoreDescriptorV4>() as u32,
             context: Box::into_raw(Box::new(provider)).cast(),
             get: Some(provider_get),
+            get_ranges: Some(provider_ranges),
             list_open: Some(provider_list_open),
             list_next: Some(provider_list_next),
             list_close: Some(provider_list_close),
+            list_delimiter: Some(provider_delimiter),
             put: Some(provider_put),
-            delete_object: Some(provider_delete),
+            delete_batch: Some(provider_delete),
+            copy: Some(provider_copy),
+            rename: Some(provider_rename),
+            multipart_open: Some(provider_multipart_open),
+            multipart_part_open: Some(provider_part_open),
+            multipart_part_wait: Some(provider_part_wait),
+            multipart_part_close: Some(provider_part_close),
+            multipart_complete: Some(provider_complete),
+            multipart_abort: Some(provider_abort),
+            multipart_close: Some(provider_upload_close),
             release: Some(provider_release),
         };
         (descriptor, probe)
@@ -870,17 +1038,26 @@ mod tests {
     unsafe extern "C" fn provider_get(
         context: *mut c_void,
         path: KernelNativeStringSliceV1,
-        options: KernelNativeGetOptionsV3,
+        options: KernelNativeGetOptionsV4,
         sink_context: *mut c_void,
         sink: unsafe extern "C" fn(
             *mut c_void,
-            *const KernelNativeObjectMetaV1,
+            *const KernelNativeObjectMetaV4,
             KernelNativeByteSliceV1,
             u64,
             u64,
+            *const KernelNativeKeyValueV4,
+            usize,
         ) -> i32,
     ) -> i32 {
         let provider = unsafe { &*context.cast::<Provider>() };
+        provider
+            .probe
+            .get_conditions
+            .lock()
+            .unwrap()
+            .push(unsafe { GetConditions::copy(options) });
+        let options = options.base;
         provider.probe.io_calls.fetch_add(1, Ordering::SeqCst);
         let path = unsafe { input_string(path) };
         let request = (options.head, options.range_kind, options.start, options.end);
@@ -922,7 +1099,10 @@ mod tests {
         };
         let range = provider.actual_range.clone().unwrap_or_else(|| {
             requested
-                .map(|range| range.as_range(size).unwrap())
+                .map(|range| match range {
+                    GetRange::Bounded(range) if range.start == range.end => range,
+                    range => range.as_range(size).unwrap(),
+                })
                 .unwrap_or(0..size)
         });
         let body = if options.head == 1 && provider.get_case != GetCase::HeadBody {
@@ -966,19 +1146,59 @@ mod tests {
             }
             _ => {}
         }
+        let e_tag = provider.metadata.then(|| "native-etag".to_string());
+        let version = provider.metadata.then(String::new);
+        let mut meta = fixture_meta(meta);
+        meta.e_tag = marshalling::optional_string_slice(e_tag.as_deref());
+        meta.version = marshalling::optional_string_slice(version.as_deref());
+        let attribute_pairs = response_attributes(provider.metadata);
+        let attributes = attribute_views(&attribute_pairs);
+        let (attributes_ptr, attributes_len) = malformed_attributes(provider.v4_case, &attributes);
+        if provider.v4_case == "optional_null" {
+            meta.e_tag = KernelNativeStringSliceV1 {
+                ptr: std::ptr::null(),
+                len: 1,
+            };
+        }
+        if provider.v4_case == "optional_utf8" {
+            meta.version = KernelNativeStringSliceV1 {
+                ptr: [0xffu8].as_ptr().cast(),
+                len: 1,
+            };
+        }
         let meta_ptr = if provider.get_case == GetCase::NullMeta {
             std::ptr::null()
         } else if provider.get_case == GetCase::UnalignedMeta {
             NonNull::<u8>::dangling().as_ptr().cast()
         } else {
-            &meta as *const KernelNativeObjectMetaV1
+            &meta as *const KernelNativeObjectMetaV4
         };
-        let status = unsafe { sink(sink_context, meta_ptr, bytes, range.start, range.end) };
+        let status = unsafe {
+            sink(
+                sink_context,
+                meta_ptr,
+                bytes,
+                range.start,
+                range.end,
+                attributes_ptr,
+                attributes_len,
+            )
+        };
         if status != KERNEL_NATIVE_STATUS_OK {
             return status;
         }
         if provider.get_case == GetCase::DuplicateSink {
-            return unsafe { sink(sink_context, meta_ptr, bytes, range.start, range.end) };
+            return unsafe {
+                sink(
+                    sink_context,
+                    meta_ptr,
+                    bytes,
+                    range.start,
+                    range.end,
+                    attributes_ptr,
+                    attributes_len,
+                )
+            };
         }
         provider.status
     }
@@ -991,6 +1211,7 @@ mod tests {
         gate: Option<Arc<CallGate>>,
         gate_after: usize,
         status: i32,
+        metadata: bool,
     }
 
     unsafe extern "C" fn provider_list_open(
@@ -1034,6 +1255,7 @@ mod tests {
                 gate: provider.list_gate.clone(),
                 gate_after: provider.gate_after,
                 status: provider.status,
+                metadata: provider.metadata,
             }))
             .cast()
         };
@@ -1043,7 +1265,7 @@ mod tests {
     unsafe extern "C" fn provider_list_next(
         cursor: *mut c_void,
         sink_context: *mut c_void,
-        sink: unsafe extern "C" fn(*mut c_void, *const KernelNativeObjectMetaV1) -> i32,
+        sink: unsafe extern "C" fn(*mut c_void, *const KernelNativeObjectMetaV4) -> i32,
         has_more: *mut u32,
     ) -> i32 {
         let cursor = unsafe { &mut *cursor.cast::<ProviderCursor>() };
@@ -1065,11 +1287,15 @@ mod tests {
             (cursor.position + batch_size).min(cursor.names.len())
         };
         for name in &cursor.names[cursor.position..end] {
-            let meta = KernelNativeObjectMetaV1 {
+            let e_tag = cursor.metadata.then(|| "list-etag".to_string());
+            let version = cursor.metadata.then(|| "list-version".to_string());
+            let mut meta = fixture_meta(KernelNativeObjectMetaV1 {
                 location: string_slice(name),
                 size: 4,
                 last_modified_unix_ms: 0,
-            };
+            });
+            meta.e_tag = marshalling::optional_string_slice(e_tag.as_deref());
+            meta.version = marshalling::optional_string_slice(version.as_deref());
             let meta_ptr = if cursor.case == ListCase::NullMeta {
                 std::ptr::null()
             } else {
@@ -1101,10 +1327,18 @@ mod tests {
         context: *mut c_void,
         path: KernelNativeStringSliceV1,
         body: KernelNativeByteSliceV1,
-        mode: u32,
+        options: KernelNativeWriteOptionsV4,
+        sink_context: *mut c_void,
+        sink: unsafe extern "C" fn(*mut c_void, *const KernelNativePutResultV4) -> i32,
     ) -> i32 {
         let provider = unsafe { &*context.cast::<Provider>() };
         provider.probe.io_calls.fetch_add(1, Ordering::SeqCst);
+        provider
+            .probe
+            .write_options
+            .lock()
+            .unwrap()
+            .push(unsafe { WriteRequest::copy(options) });
         let path = unsafe { input_string(path) };
         let body = if body.len == 0 {
             Vec::new()
@@ -1116,24 +1350,76 @@ mod tests {
             .put_requests
             .lock()
             .unwrap()
-            .push((path, body, mode));
+            .push((path, body, options.mode));
+        if provider.status == KERNEL_NATIVE_STATUS_OK {
+            return unsafe {
+                fixture_put_result(provider.metadata, provider.v4_case, sink_context, sink)
+            };
+        }
         provider.status
     }
 
     unsafe extern "C" fn provider_delete(
         context: *mut c_void,
-        path: KernelNativeStringSliceV1,
+        paths: *const KernelNativeStringSliceV1,
+        count: usize,
+        sink_context: *mut c_void,
+        sink: unsafe extern "C" fn(*mut c_void, KernelNativeStringSliceV1, i32) -> i32,
     ) -> i32 {
         let provider = unsafe { &*context.cast::<Provider>() };
         provider.probe.io_calls.fetch_add(1, Ordering::SeqCst);
-        provider
-            .probe
-            .delete_requests
-            .lock()
-            .unwrap()
-            .push(unsafe { input_string(path) });
-        provider.status
+        provider.probe.delete_batches.lock().unwrap().push(count);
+        if provider.v4_case == "aggregate" {
+            return unsafe {
+                sink(
+                    sink_context,
+                    marshalling::optional_string_slice(None),
+                    KERNEL_NATIVE_STATUS_GENERIC,
+                )
+            };
+        }
+        if provider.v4_case == "delete_missing" {
+            return KERNEL_NATIVE_STATUS_OK;
+        }
+        if provider.v4_case == "delete_null" {
+            return unsafe {
+                sink(
+                    sink_context,
+                    marshalling::optional_string_slice(None),
+                    KERNEL_NATIVE_STATUS_OK,
+                )
+            };
+        }
+        for path in unsafe { std::slice::from_raw_parts(paths, count) } {
+            provider
+                .probe
+                .delete_requests
+                .lock()
+                .unwrap()
+                .push(unsafe { input_string(*path) });
+            let status = unsafe { sink(sink_context, *path, provider.status) };
+            if status != KERNEL_NATIVE_STATUS_OK {
+                return status;
+            }
+        }
+        if provider.v4_case == "delete_extra" {
+            return unsafe { sink(sink_context, *paths, KERNEL_NATIVE_STATUS_OK) };
+        }
+        if provider.v4_case == "delete_partial_failure" {
+            return KERNEL_NATIVE_STATUS_GENERIC;
+        }
+        KERNEL_NATIVE_STATUS_OK
     }
+
+    fn fixture_meta(base: KernelNativeObjectMetaV1) -> KernelNativeObjectMetaV4 {
+        KernelNativeObjectMetaV4 {
+            base,
+            e_tag: marshalling::optional_string_slice(None),
+            version: marshalling::optional_string_slice(None),
+        }
+    }
+
+    include!("native_object_store/v4_tests.rs");
 
     fn rest_config() -> crate::rest_engine::CRestEndpointConfig {
         let field = "field";
@@ -1161,8 +1447,9 @@ mod tests {
     #[case(Some((1, 56)))]
     #[case(Some((2, 0)))]
     #[case(Some((2, 48)))]
-    #[case(Some((3, size_of::<KernelNativeObjectStoreDescriptorV3>() as u32 - 1)))]
-    #[case(Some((3, size_of::<KernelNativeObjectStoreDescriptorV3>() as u32 + 1)))]
+    #[case(Some((3, size_of::<KernelNativeObjectStoreDescriptorV3>() as u32)))]
+    #[case(Some((4, size_of::<KernelNativeObjectStoreDescriptorV4>() as u32 - 1)))]
+    #[case(Some((4, size_of::<KernelNativeObjectStoreDescriptorV4>() as u32 + 1)))]
     fn descriptor_header_is_rejected_before_reading_full_layout(
         #[case] header: Option<(u32, u32)>,
     ) {
@@ -1184,11 +1471,22 @@ mod tests {
     #[rstest]
     #[case("context")]
     #[case("get")]
+    #[case("get_ranges")]
     #[case("list_open")]
     #[case("list_next")]
     #[case("list_close")]
+    #[case("list_delimiter")]
     #[case("put")]
     #[case("delete")]
+    #[case("copy")]
+    #[case("rename")]
+    #[case("multipart_open")]
+    #[case("multipart_part_open")]
+    #[case("multipart_part_wait")]
+    #[case("multipart_part_close")]
+    #[case("multipart_complete")]
+    #[case("multipart_abort")]
+    #[case("multipart_close")]
     #[case("release")]
     fn missing_descriptor_fields_do_not_adopt_or_release(#[case] field: &str) {
         let (mut descriptor, probe) = descriptor_for(Provider::default());
@@ -1196,11 +1494,22 @@ mod tests {
         match field {
             "context" => descriptor.context = std::ptr::null_mut(),
             "get" => descriptor.get = None,
+            "get_ranges" => descriptor.get_ranges = None,
             "list_open" => descriptor.list_open = None,
             "list_next" => descriptor.list_next = None,
             "list_close" => descriptor.list_close = None,
+            "list_delimiter" => descriptor.list_delimiter = None,
             "put" => descriptor.put = None,
-            "delete" => descriptor.delete_object = None,
+            "delete" => descriptor.delete_batch = None,
+            "copy" => descriptor.copy = None,
+            "rename" => descriptor.rename = None,
+            "multipart_open" => descriptor.multipart_open = None,
+            "multipart_part_open" => descriptor.multipart_part_open = None,
+            "multipart_part_wait" => descriptor.multipart_part_wait = None,
+            "multipart_part_close" => descriptor.multipart_part_close = None,
+            "multipart_complete" => descriptor.multipart_complete = None,
+            "multipart_abort" => descriptor.multipart_abort = None,
+            "multipart_close" => descriptor.multipart_close = None,
             "release" => descriptor.release = None,
             _ => unreachable!(),
         }
@@ -1227,7 +1536,7 @@ mod tests {
         drop(retained);
         assert_eq!(probe.releases.load(Ordering::SeqCst), 0);
         assert_eq!(probe.io_calls.load(Ordering::SeqCst), 0);
-        let (meta, body, _) = operation().unwrap();
+        let (meta, body, _, _) = operation().unwrap();
         assert_eq!(body.as_ref(), b"data");
         assert_eq!(meta.location.as_ref(), "table/a");
         drop(operation);
@@ -1384,7 +1693,7 @@ mod tests {
             ..Default::default()
         });
         let path = "table/\u{96ea}";
-        let (meta, body, _) = unsafe { handle.as_ref() }
+        let (meta, body, _, _) = unsafe { handle.as_ref() }
             .get_sync(path, &Default::default())
             .unwrap();
         unsafe { free_native_object_store(handle) };
@@ -1502,6 +1811,9 @@ mod tests {
     #[case(KERNEL_NATIVE_STATUS_NOT_FOUND, "not_found")]
     #[case(KERNEL_NATIVE_STATUS_ALREADY_EXISTS, "already_exists")]
     #[case(KERNEL_NATIVE_STATUS_NOT_SUPPORTED, "unsupported")]
+    #[case(KERNEL_NATIVE_STATUS_PRECONDITION, "precondition")]
+    #[case(KERNEL_NATIVE_STATUS_NOT_MODIFIED, "not_modified")]
+    #[case(KERNEL_NATIVE_STATUS_NOT_IMPLEMENTED, "not_implemented")]
     #[case(KERNEL_NATIVE_STATUS_GENERIC, "generic")]
     #[case(-1, "generic")]
     #[case(i32::MAX, "generic")]
@@ -1518,6 +1830,16 @@ mod tests {
                 Err(ObjectStoreError::AlreadyExists { .. })
             )),
             "unsupported" => assert!(matches!(result, Err(ObjectStoreError::NotSupported { .. }))),
+            "precondition" => assert!(
+                matches!(result, Err(ObjectStoreError::Precondition { path, .. }) if path == "table/a")
+            ),
+            "not_modified" => assert!(
+                matches!(result, Err(ObjectStoreError::NotModified { path, .. }) if path == "table/a")
+            ),
+            "not_implemented" => assert!(matches!(
+                result,
+                Err(ObjectStoreError::NotImplemented { .. })
+            )),
             "generic" => match result.unwrap_err() {
                 ObjectStoreError::Generic { source, .. } => {
                     assert_eq!(source.to_string(), "native object store callback failed");
@@ -1536,7 +1858,9 @@ mod tests {
     #[case("if_unmodified_since")]
     #[case("extensions")]
     #[tokio::test]
-    async fn unsupported_get_options_are_explicitly_rejected(#[case] option: &str) {
+    async fn get_options_forward_to_native_except_explicitly_unsupported_extensions(
+        #[case] option: &str,
+    ) {
         let mut options = GetOptions::default();
         match option {
             "version" => options.version = Some("v1".into()),
@@ -1552,13 +1876,18 @@ mod tests {
             _ => unreachable!(),
         }
         let (handle, probe) = handle_for(Provider::default());
-        assert!(matches!(
-            unsafe { handle.as_ref() }
-                .get_opts(&Path::from("table/a"), options)
-                .await,
-            Err(ObjectStoreError::NotSupported { .. })
-        ));
-        assert_eq!(probe.io_calls.load(Ordering::SeqCst), 0);
+        let result = unsafe { handle.as_ref() }
+            .get_opts(&Path::from("table/a"), options)
+            .await;
+        if option == "extensions" {
+            assert!(matches!(result, Err(ObjectStoreError::NotSupported { .. })));
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(
+            probe.io_calls.load(Ordering::SeqCst),
+            usize::from(option != "extensions")
+        );
         unsafe { free_native_object_store(handle) };
     }
 
@@ -1594,22 +1923,22 @@ mod tests {
     }
 
     #[test]
-    fn v3_layout_and_misaligned_descriptor_header_are_checked() {
+    fn v4_layout_and_misaligned_descriptor_header_are_checked() {
         assert_eq!(size_of::<KernelNativeGetOptionsV3>(), 24);
         if size_of::<usize>() == 8 {
-            assert_eq!(size_of::<KernelNativeObjectStoreDescriptorV3>(), 72);
+            assert_eq!(size_of::<KernelNativeObjectStoreDescriptorV4>(), 160);
         }
         let mut storage = [0u64; 2];
         let descriptor = unsafe { storage.as_mut_ptr().cast::<u8>().add(1) }
-            .cast::<KernelNativeObjectStoreDescriptorV3>();
+            .cast::<KernelNativeObjectStoreDescriptorV4>();
         unsafe {
             descriptor
                 .cast::<u32>()
-                .write_unaligned(KERNEL_NATIVE_STORE_ABI_V3);
+                .write_unaligned(KERNEL_NATIVE_STORE_ABI_V4);
             descriptor
                 .cast::<u32>()
                 .add(1)
-                .write_unaligned(size_of::<KernelNativeObjectStoreDescriptorV3>() as u32);
+                .write_unaligned(size_of::<KernelNativeObjectStoreDescriptorV4>() as u32);
         }
         assert_extern_result_error_contains(
             unsafe { get_native_object_store(descriptor, allocate_err) },
@@ -1809,6 +2138,9 @@ mod tests {
     #[case(KERNEL_NATIVE_STATUS_NOT_FOUND)]
     #[case(KERNEL_NATIVE_STATUS_GENERIC)]
     #[case(KERNEL_NATIVE_STATUS_NOT_SUPPORTED)]
+    #[case(KERNEL_NATIVE_STATUS_PRECONDITION)]
+    #[case(KERNEL_NATIVE_STATUS_NOT_MODIFIED)]
+    #[case(KERNEL_NATIVE_STATUS_NOT_IMPLEMENTED)]
     #[tokio::test]
     async fn get_put_delete_propagate_native_error_statuses(#[case] status: i32) {
         let (handle, probe) = handle_for(Provider {
@@ -1844,6 +2176,15 @@ mod tests {
                 ),
                 KERNEL_NATIVE_STATUS_NOT_SUPPORTED => {
                     assert!(matches!(error, ObjectStoreError::NotSupported { .. }))
+                }
+                KERNEL_NATIVE_STATUS_PRECONDITION => assert!(
+                    matches!(error, ObjectStoreError::Precondition { path, .. } if path == "table/a")
+                ),
+                KERNEL_NATIVE_STATUS_NOT_MODIFIED => assert!(
+                    matches!(error, ObjectStoreError::NotModified { path, .. } if path == "table/a")
+                ),
+                KERNEL_NATIVE_STATUS_NOT_IMPLEMENTED => {
+                    assert!(matches!(error, ObjectStoreError::NotImplemented { .. }))
                 }
                 _ => assert!(matches!(error, ObjectStoreError::Generic { .. })),
             }
@@ -1893,7 +2234,9 @@ mod tests {
     #[case("attributes")]
     #[case("extensions")]
     #[tokio::test]
-    async fn unsupported_put_options_are_rejected_without_io(#[case] option: &str) {
+    async fn put_options_forward_to_native_except_explicitly_unsupported_extensions(
+        #[case] option: &str,
+    ) {
         let mut options = PutOptions::default();
         match option {
             "update" => {
@@ -1915,18 +2258,23 @@ mod tests {
             _ => unreachable!(),
         }
         let (handle, probe) = handle_for(Provider::default());
-        assert!(matches!(
-            unsafe { handle.as_ref() }
-                .put_opts(&Path::from("table/a"), b"data".as_slice().into(), options)
-                .await,
-            Err(ObjectStoreError::NotSupported { .. })
-        ));
-        assert_eq!(probe.io_calls.load(Ordering::SeqCst), 0);
+        let result = unsafe { handle.as_ref() }
+            .put_opts(&Path::from("table/a"), b"data".as_slice().into(), options)
+            .await;
+        if option == "extensions" {
+            assert!(matches!(result, Err(ObjectStoreError::NotSupported { .. })));
+        } else {
+            assert!(result.is_ok());
+        }
+        assert_eq!(
+            probe.io_calls.load(Ordering::SeqCst),
+            usize::from(option != "extensions")
+        );
         unsafe { free_native_object_store(handle) };
     }
 
     #[tokio::test]
-    async fn bounded_inputs_and_remaining_operations_are_explicitly_unsupported() {
+    async fn oversized_inputs_are_rejected_before_native_io() {
         let (handle, probe) = handle_for(Provider::default());
         let store = unsafe { handle.as_ref() };
         let oversized = Path::from("a".repeat(MAX_PATH_BYTES + 1));
@@ -1966,21 +2314,17 @@ mod tests {
         ));
         assert!(matches!(
             store
-                .put_multipart_opts(&Path::from("table/a"), Default::default())
+                .put_multipart_opts(&oversized, Default::default())
                 .await,
             Err(ObjectStoreError::NotSupported { .. })
         ));
         assert!(matches!(
-            store.list_with_delimiter(None).await,
+            store.list_with_delimiter(Some(&oversized)).await,
             Err(ObjectStoreError::NotSupported { .. })
         ));
         assert!(matches!(
             store
-                .copy_opts(
-                    &Path::from("table/a"),
-                    &Path::from("table/b"),
-                    Default::default()
-                )
+                .copy_opts(&oversized, &Path::from("table/b"), Default::default())
                 .await,
             Err(ObjectStoreError::NotSupported { .. })
         ));

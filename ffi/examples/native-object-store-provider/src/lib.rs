@@ -1,11 +1,11 @@
-//! Independent native ObjectStore prototype. Only the frozen C descriptor crosses DLL boundaries.
+//! Independent native ObjectStore prototype. Only the v3 C descriptor crosses DLL boundaries.
 //! The provider module and its runtime must stay loaded for the lifetime of the process.
 
 use std::ffi::c_void;
 use std::mem::size_of;
 
 use delta_kernel_native_store_abi::{
-    KernelNativeObjectStoreDescriptorV1, KernelNativeStringSliceV1, KERNEL_NATIVE_STATUS_GENERIC,
+    KernelNativeObjectStoreDescriptorV3, KernelNativeStringSliceV1, KERNEL_NATIVE_STATUS_GENERIC,
 };
 
 mod credentials;
@@ -20,7 +20,7 @@ mod provider;
 /// Call from an ordinary thread, not an asynchronous runtime worker.
 #[no_mangle]
 pub unsafe extern "C" fn prototype_create_memory(
-    out: *mut KernelNativeObjectStoreDescriptorV1,
+    out: *mut KernelNativeObjectStoreDescriptorV3,
 ) -> i32 {
     provider::guarded(|| {
         if out.is_null() {
@@ -46,7 +46,7 @@ pub unsafe extern "C" fn prototype_create_memory(
 #[no_mangle]
 pub unsafe extern "C" fn prototype_create_azure(
     endpoint: KernelNativeStringSliceV1,
-    out: *mut KernelNativeObjectStoreDescriptorV1,
+    out: *mut KernelNativeObjectStoreDescriptorV3,
 ) -> i32 {
     provider::guarded(|| {
         if out.is_null() {
@@ -62,8 +62,8 @@ pub unsafe extern "C" fn prototype_create_azure(
     })
 }
 
-/// Atomically appends version one to the seeded memory table. Returns AlreadyExists on repetition
-/// and NotSupported for Azure. Does not consume the context or change its ownership.
+/// Atomically appends version one to the seeded memory table. Returns AlreadyExists status 2 on
+/// repetition and NotSupported for Azure. Does not consume the context or change its ownership.
 ///
 /// # Safety
 /// `context` must be null or an unreleased context from this provider. After Kernel adoption, this
@@ -95,8 +95,8 @@ pub extern "C" fn prototype_credential_generation() -> u64 {
     credentials::generation()
 }
 
-/// Returns the aggregate process-global GET, LIST, PUT and DELETE callback invocation count.
-/// Includes failed attempts; excludes factories, sinks, direct append operations and release.
+/// Returns the aggregate process-global GET, LIST advance, PUT and DELETE invocation count.
+/// Includes failed attempts; excludes LIST open/close, factories, sinks, direct append and release.
 #[no_mangle]
 pub extern "C" fn prototype_callback_count() -> u64 {
     provider::callback_count()
@@ -105,5 +105,5 @@ pub extern "C" fn prototype_callback_count() -> u64 {
 /// Returns this library's exact descriptor size for the current platform, without packing.
 #[no_mangle]
 pub extern "C" fn prototype_descriptor_size() -> u32 {
-    size_of::<KernelNativeObjectStoreDescriptorV1>() as u32
+    size_of::<KernelNativeObjectStoreDescriptorV3>() as u32
 }

@@ -78,7 +78,14 @@ fn configure_mtls(
 /// Build a [`reqwest::Client`] from [`RestClientOptions`]. Enables mTLS when `cert_path`,
 /// `key_path`, and `ca_path` are all present.
 pub fn build_rest_client(opts: &RestClientOptions) -> ObjectStoreResult<Client> {
-    let mut builder = Client::builder();
+    build_rest_client_with_redirect_policy(opts, reqwest::redirect::Policy::default())
+}
+
+pub(super) fn build_rest_client_with_redirect_policy(
+    opts: &RestClientOptions,
+    redirect: reqwest::redirect::Policy,
+) -> ObjectStoreResult<Client> {
+    let mut builder = Client::builder().redirect(redirect);
     // Pin the TLS backend when both are compiled in: prefer rustls (the crate's default
     // feature), since reqwest otherwise defaults to native-tls and would mismatch the
     // rustls-built identity. native-tls is used only when it is the sole backend.

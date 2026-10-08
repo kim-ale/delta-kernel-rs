@@ -811,6 +811,8 @@ pub(crate) enum ObjectStoreBackend {
     UrlScheme,
     /// REST file API; configured via [`builder_with_rest_object_store`].
     Rest(Box<rest_engine::RestBuilderState>),
+    /// Literal Blob REST; configured via [`builder_with_azure_blob_rest_store`].
+    AzureBlobRest(Option<rest_engine::FfiAuthHeaderProvider>),
 }
 
 /// A builder that allows setting options on the `Engine` before actually building it.
@@ -1056,6 +1058,35 @@ fn builder_with_rest_object_store_impl(
     Ok(())
 }
 
+/// Select literal Azure Blob HTTP using the existing ready-header callback contract.
+///
+/// The builder URL must be an HTTP(S) container URL, optionally with SAS. Snapshot paths
+/// remain logical `az://container/table/` URLs. No JSON endpoint configuration is used.
+/// Options are validated by the owning Rust factory when [`builder_build`] is called.
+/// The returned builder is owned by the caller and must eventually be built or freed.
+///
+/// # Safety
+///
+/// `builder` must be valid and is consumed unconditionally, regardless of the result.
+/// Do not reuse or free the input handle. When supplied, `callback` must be safe to call
+/// concurrently from any thread, and `context` must remain valid for the engine lifetime.
+/// Callback output follows [`rest_engine::CAuthHeaderCallback`] ownership and TTL rules.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn builder_with_azure_blob_rest_store(
+    builder: Handle<ExclusiveEngineBuilder>,
+    callback: Option<extern "C" fn(NullableCvoid, *mut rest_engine::CAuthHeaders, AllocateErrorFn)>,
+    context: NullableCvoid,
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let allocate_fn = builder.allocate_fn;
+    builder.object_store_backend =
+        ObjectStoreBackend::AzureBlobRest(callback.map(|callback| {
+            rest_engine::FfiAuthHeaderProvider::new(callback, context, allocate_fn)
+        }));
+    Ok(builder.into()).into_extern_result(&allocate_fn)
+}
+
 /// Consume the builder and return a default engine. The builder is consumed regardless of the
 /// result and must not be used or freed after this call.
 ///
@@ -1144,6 +1175,9 @@ fn get_default_engine_impl(
         ObjectStoreBackend::UrlScheme => store_from_url_opts(&url, options)?,
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
+        }
+        ObjectStoreBackend::AzureBlobRest(callback) => {
+            rest_engine::build_blob_rest_object_store(&url, &options, callback)?
         }
     };
     build_engine_from_store(store, executor_config, io_config, allocate_error)
@@ -2586,6 +2620,20 @@ mod tests {
                 FFIKernelError::GenericError,
                 "null CRestEndpointConfig pointer",
             );
+        }
+    }
+
+    #[test]
+    fn azure_blob_rest_setter_consumes_and_returns_owned_builder() {
+        let path = "https://example.test/container";
+        unsafe {
+            let builder = ok_or_panic(get_engine_builder(kernel_string_slice!(path), allocate_err));
+            let builder = ok_or_panic(builder_with_azure_blob_rest_store(builder, None, None));
+            assert!(matches!(
+                builder.as_ref().object_store_backend,
+                ObjectStoreBackend::AzureBlobRest(None)
+            ));
+            free_engine_builder(builder);
         }
     }
 

@@ -18,8 +18,9 @@ use std::time::Duration;
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{KernelError, KernelResult};
 use delta_kernel_default_engine::rest_store::{
-    build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
-    RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
+    build_azure_blob_rest_store, build_rest_client, headers_from_pairs, AuthHeaderProvider,
+    HeaderMap, RefreshingHeaderProvider, RestClientOptions, RestEndpointConfig, RestObjectStore,
+    StaticHeaderProvider,
 };
 use derive_more::Constructor;
 use url::Url;
@@ -187,6 +188,29 @@ impl FfiAuthHeaderProvider {
     }
 }
 
+pub(crate) fn build_blob_rest_object_store(
+    base_url: &Url,
+    options: &HashMap<String, String>,
+    callback: Option<FfiAuthHeaderProvider>,
+) -> KernelResult<Arc<dyn ObjectStore>> {
+    Ok(build_azure_blob_rest_store(
+        base_url,
+        options,
+        callback.map(refreshing_auth_provider),
+    )?)
+}
+
+fn refreshing_auth_provider(provider: FfiAuthHeaderProvider) -> Arc<dyn AuthHeaderProvider> {
+    Arc::new(RefreshingHeaderProvider::new(move || {
+        provider
+            .collect()
+            .map_err(|failure| ObjectStoreError::Generic {
+                store: "RestObjectStore",
+                source: failure.into(),
+            })
+    }))
+}
+
 /// Build REST builder state from FFI endpoint config and optional auth callback.
 pub(crate) fn rest_builder_state_from_ffi(
     endpoint_config: &CRestEndpointConfig,
@@ -284,15 +308,7 @@ pub(crate) fn build_rest_object_store(
     let config = rest.endpoint_config.clone();
 
     let auth: Arc<dyn AuthHeaderProvider> = match rest.auth_callback {
-        Some(cb) => {
-            let provider = cb;
-            Arc::new(RefreshingHeaderProvider::new(move || {
-                provider.collect().map_err(|e| ObjectStoreError::Generic {
-                    store: "RestObjectStore",
-                    source: e.into(),
-                })
-            }))
-        }
+        Some(cb) => refreshing_auth_provider(cb),
         None => {
             let header_pairs = options.iter().filter_map(|(k, v)| {
                 k.strip_prefix(REST_BUILDER_OPTION_HEADER_PREFIX)

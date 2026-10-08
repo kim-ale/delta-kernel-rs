@@ -15,10 +15,14 @@
 //!
 //! Only the operations kernel needs are implemented (read, head, list, write, delete); the rest
 //! return [`ObjectStoreError::NotSupported`].
+//!
+//! [`AzureBlobRestStore`] is a separate literal Blob HTTP dialect sharing the ready-header
+//! and TLS client contracts. It does not use [`RestEndpointConfig`] or native Azure delegation.
 
 use delta_kernel::object_store::Error as ObjectStoreError;
 
 mod auth;
+mod azure_blob;
 mod client;
 mod config;
 mod response;
@@ -29,6 +33,7 @@ mod tests;
 pub use auth::{
     headers_from_pairs, AuthHeaderProvider, RefreshingHeaderProvider, StaticHeaderProvider,
 };
+pub use azure_blob::{build_azure_blob_rest_store, AzureBlobRestStore};
 pub use client::{build_rest_client, RestClientOptions};
 pub use config::RestEndpointConfig;
 // Re-exported so callers can name the header type in `AuthHeaderProvider`'s public API.

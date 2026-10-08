@@ -811,6 +811,8 @@ pub(crate) enum ObjectStoreBackend {
     UrlScheme,
     /// REST file API; configured via [`builder_with_rest_object_store`].
     Rest(Box<rest_engine::RestBuilderState>),
+    /// Native Azure Blob protocol with optional ready caller headers.
+    AzureBlobHeaders(rest_engine::AzureBlobBuilderState),
 }
 
 /// A builder that allows setting options on the `Engine` before actually building it.
@@ -1056,6 +1058,44 @@ fn builder_with_rest_object_store_impl(
     Ok(())
 }
 
+/// Select native Azure Blob storage with ready headers, not the JSON REST file API.
+///
+/// Use a logical `az://container/table/` URL. Native Azure options, `header.<Name>`,
+/// `retry.max_retries`, and `blob.auth_mode` are validated by default-engine. Native/default mode
+/// retains native auth; headers mode disables signing and requires a ready bearer or request SAS.
+/// REST `tls.*` and `put.verify_on_ambiguous` options are unsupported. See
+/// [`delta_kernel_default_engine::rest_store::azure_blob`] for protocol and batch limitations.
+/// With a null callback, static headers use the same options as REST. This does not disable native
+/// credentials in native mode. Mode is checked here and options are revalidated at builder build.
+///
+/// # Errors
+///
+/// Returns an error for an invalid currently configured `blob.auth_mode`; consumes the builder
+/// on every result, allocating errors with the allocator registered on the builder.
+///
+/// # Safety
+///
+/// `builder` must be a valid exclusive handle. It is consumed before validation and must never
+/// be reused or freed after this call. The returned builder is caller-owned. Callback/context
+/// are borrowed: context must outlive the built engine (or discarded builder), and callbacks must
+/// return ready values and be concurrency-safe under the existing REST callback contract.
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn builder_with_azure_blob_headers(
+    builder: Handle<ExclusiveEngineBuilder>,
+    callback: Option<extern "C" fn(NullableCvoid, *mut rest_engine::CAuthHeaders, AllocateErrorFn)>,
+    context: NullableCvoid,
+) -> ExternResult<Handle<ExclusiveEngineBuilder>> {
+    let mut builder = unsafe { builder.into_inner() };
+    let allocate_fn = builder.allocate_fn;
+    rest_engine::AzureBlobBuilderState::new(&builder.options, callback, context, allocate_fn)
+        .map(|state| {
+            builder.object_store_backend = ObjectStoreBackend::AzureBlobHeaders(state);
+            builder.into()
+        })
+        .into_extern_result(&allocate_fn)
+}
+
 /// Consume the builder and return a default engine. The builder is consumed regardless of the
 /// result and must not be used or freed after this call.
 ///
@@ -1145,8 +1185,65 @@ fn get_default_engine_impl(
         ObjectStoreBackend::Rest(rest) => {
             rest_engine::build_rest_object_store(&url, &options, rest.as_ref())?
         }
+        ObjectStoreBackend::AzureBlobHeaders(state) => {
+            rest_engine::build_azure_blob_object_store(&url, &options, &state)?
+        }
     };
     build_engine_from_store(store, executor_config, io_config, allocate_error)
+}
+
+#[cfg(all(test, feature = "default-engine-base"))]
+mod azure_blob_tests {
+    use super::*;
+    use crate::error::FFIKernelError;
+    use crate::ffi_test_utils::{
+        allocate_err, assert_extern_result_error_with_message, ok_or_panic,
+    };
+
+    #[test]
+    fn azure_blob_setter_consumes_and_retains_existing_engine_configuration() {
+        let handle = get_engine_builder_impl(
+            Url::parse("az://container/table/").map_err(Into::into),
+            allocate_err,
+        )
+        .unwrap();
+        let handle = unsafe { builder_with_io_concurrency(handle, 4, 8) };
+        let handle = unsafe { ok_or_panic(builder_with_azure_blob_headers(handle, None, None)) };
+        let builder = unsafe { handle.into_inner() };
+        assert!(matches!(
+            builder.object_store_backend,
+            ObjectStoreBackend::AzureBlobHeaders(_)
+        ));
+        assert_eq!(builder.io_config.buffer_size.unwrap().get(), 4);
+        assert_eq!(builder.io_config.batch_size.unwrap().get(), 8);
+    }
+
+    #[test]
+    fn azure_blob_setter_invalid_mode_consumes_builder_and_allocates_error() {
+        let handle = get_engine_builder_impl(
+            Url::parse("az://container/table/").map_err(Into::into),
+            allocate_err,
+        )
+        .unwrap();
+        let mut builder = unsafe { handle.into_inner() };
+        builder.set_option("blob.auth_mode".into(), "invalid".into());
+        let result = unsafe { builder_with_azure_blob_headers(builder.into(), None, None) };
+        assert_extern_result_error_with_message(result, FFIKernelError::ObjectStoreError, None);
+    }
+
+    #[test]
+    fn azure_blob_build_failure_consumes_builder_before_unknown_option_validation() {
+        let handle = get_engine_builder_impl(
+            Url::parse("az://container/table/").map_err(Into::into),
+            allocate_err,
+        )
+        .unwrap();
+        let handle = unsafe { ok_or_panic(builder_with_azure_blob_headers(handle, None, None)) };
+        let mut builder = unsafe { handle.into_inner() };
+        builder.set_option("not_an_azure_option".into(), "value".into());
+        let result = unsafe { builder_build(builder.into()) };
+        assert_extern_result_error_with_message(result, FFIKernelError::ObjectStoreError, None);
+    }
 }
 
 /// Assemble a default engine from a pre-built [`ObjectStore`], applying executor and read-path I/O

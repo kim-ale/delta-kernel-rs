@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{KernelError, KernelResult};
+use delta_kernel_default_engine::rest_store::azure_blob::{
+    azure_blob_store_from_url_opts, BlobHeaderMode,
+};
 use delta_kernel_default_engine::rest_store::{
     build_rest_client, headers_from_pairs, AuthHeaderProvider, HeaderMap, RefreshingHeaderProvider,
     RestClientOptions, RestEndpointConfig, RestObjectStore, StaticHeaderProvider,
@@ -131,7 +134,7 @@ pub struct CAuthHeaders {
     pub ttl_ms: u64,
 }
 
-/// Supplies auth headers for a REST-backed engine.
+/// Supplies ready headers for REST or native Azure Blob header-backed engines.
 ///
 /// The kernel invokes this when it needs fresh headers. For each entry in `headers[0..count]`,
 /// set `name` and `value` via [`allocate_kernel_string`](crate::allocate_kernel_string) using the
@@ -145,6 +148,8 @@ pub struct CAuthHeaders {
 /// forwarded on each invocation so the callback can pass it to
 /// [`allocate_kernel_string`](crate::allocate_kernel_string) without the engine having to stash it
 /// separately.
+/// The same callback and borrowed-context lifetime apply to
+/// [`builder_with_azure_blob_headers`](crate::builder_with_azure_blob_headers).
 pub type CAuthHeaderCallback =
     extern "C" fn(context: NullableCvoid, out: *mut CAuthHeaders, allocate_error: AllocateErrorFn);
 
@@ -154,6 +159,26 @@ pub type CAuthHeaderCallback =
 pub(crate) struct RestBuilderState {
     endpoint_config: RestEndpointConfig,
     auth_callback: Option<FfiAuthHeaderProvider>,
+}
+
+/// Callback wiring for the native Azure Blob backend; HTTP policy belongs to default-engine.
+pub(crate) struct AzureBlobBuilderState {
+    auth_callback: Option<FfiAuthHeaderProvider>,
+}
+
+impl AzureBlobBuilderState {
+    pub(crate) fn new(
+        options: &HashMap<String, String>,
+        callback: Option<CAuthHeaderCallback>,
+        context: NullableCvoid,
+        allocate_error: AllocateErrorFn,
+    ) -> KernelResult<Self> {
+        BlobHeaderMode::from_options(options)?;
+        Ok(Self {
+            auth_callback: callback
+                .map(|cb| FfiAuthHeaderProvider::new(cb, context, allocate_error)),
+        })
+    }
 }
 
 /// Upcalls a [`CAuthHeaderCallback`] whenever the REST client needs fresh auth headers.
@@ -275,15 +300,12 @@ fn copy_required_string(slice: &KernelStringSlice, field: &str) -> KernelResult<
     Ok(value)
 }
 
-/// Build a [`RestObjectStore`] from an engine builder's URL, options, and REST state.
-pub(crate) fn build_rest_object_store(
-    base_url: &Url,
+/// Reuse the REST callback/TTL and static-header contract without adding backend policy.
+fn build_auth_provider(
     options: &HashMap<String, String>,
-    rest: &RestBuilderState,
-) -> KernelResult<Arc<dyn ObjectStore>> {
-    let config = rest.endpoint_config.clone();
-
-    let auth: Arc<dyn AuthHeaderProvider> = match rest.auth_callback {
+    callback: Option<FfiAuthHeaderProvider>,
+) -> KernelResult<Arc<dyn AuthHeaderProvider>> {
+    Ok(match callback {
         Some(cb) => {
             let provider = cb;
             Arc::new(RefreshingHeaderProvider::new(move || {
@@ -300,7 +322,31 @@ pub(crate) fn build_rest_object_store(
             });
             Arc::new(StaticHeaderProvider::from_pairs(header_pairs)?)
         }
-    };
+    })
+}
+
+/// Build native Azure Blob storage by delegating options and HTTP policy to default-engine.
+pub(crate) fn build_azure_blob_object_store(
+    url: &Url,
+    options: &HashMap<String, String>,
+    state: &AzureBlobBuilderState,
+) -> KernelResult<Arc<dyn ObjectStore>> {
+    let auth = build_auth_provider(options, state.auth_callback)?;
+    Ok(Arc::new(azure_blob_store_from_url_opts(
+        url,
+        options,
+        Some(auth),
+    )?))
+}
+
+/// Build a [`RestObjectStore`] from an engine builder's URL, options, and REST state.
+pub(crate) fn build_rest_object_store(
+    base_url: &Url,
+    options: &HashMap<String, String>,
+    rest: &RestBuilderState,
+) -> KernelResult<Arc<dyn ObjectStore>> {
+    let config = rest.endpoint_config.clone();
+    let auth = build_auth_provider(options, rest.auth_callback)?;
 
     let tls = RestClientOptions {
         cert_path: options.get(REST_BUILDER_OPTION_TLS_CERT_PATH).cloned(),
@@ -558,6 +604,61 @@ mod tests {
         assert_eq!(headers.get("authorization").unwrap(), "Bearer t");
         assert_eq!(headers.len(), 1);
         assert_eq!(ttl, Some(Duration::from_millis(60_000)));
+    }
+
+    extern "C" fn fill_azure_blob_slots(
+        _: NullableCvoid,
+        out: *mut CAuthHeaders,
+        _: AllocateErrorFn,
+    ) {
+        write_test_auth_headers(
+            &[
+                ("authorization", "Bearer caller-token"),
+                ("x-ms-fabric-actor-token", "actor"),
+                ("x-context-2", "2"),
+                ("x-context-3", "3"),
+                ("x-context-4", "4"),
+                ("x-context-5", "5"),
+                ("x-context-6", "6"),
+                ("x-context-7", "7"),
+            ],
+            out,
+        );
+        unsafe {
+            (*out).ttl_ms = 3_600_000;
+        }
+    }
+
+    #[test]
+    fn azure_blob_callback_reuses_slots_ownership_and_ttl_provider() {
+        let callback = FfiAuthHeaderProvider::new(fill_azure_blob_slots, None, allocate_err);
+        let provider = build_auth_provider(&HashMap::new(), Some(callback)).unwrap();
+        let headers = provider.headers().unwrap();
+        assert_eq!(headers.len(), AUTH_MAX_NUM_HEADERS);
+        assert_eq!(headers["authorization"], "Bearer caller-token");
+        assert_eq!(headers["x-ms-fabric-actor-token"], "actor");
+        assert_eq!(provider.headers().unwrap(), headers);
+    }
+
+    #[test]
+    fn azure_blob_callback_and_static_provider_precedence_match_rest() {
+        let options =
+            HashMap::from([("header.Authorization".into(), "Bearer static-token".into())]);
+        let callback = FfiAuthHeaderProvider::new(fill_auth_direct, None, allocate_err);
+        assert_eq!(
+            build_auth_provider(&options, Some(callback))
+                .unwrap()
+                .headers()
+                .unwrap()["authorization"],
+            "Bearer t"
+        );
+        assert_eq!(
+            build_auth_provider(&options, None)
+                .unwrap()
+                .headers()
+                .unwrap()["authorization"],
+            "Bearer static-token"
+        );
     }
 
     // === Group 3: client-build tests (call build_rest_object_store) ===

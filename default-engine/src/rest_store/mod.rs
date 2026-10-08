@@ -15,10 +15,14 @@
 //!
 //! Only the operations kernel needs are implemented (read, head, list, write, delete); the rest
 //! return [`ObjectStoreError::NotSupported`].
+//!
+//! For native Azure Blob XML/block protocol with the same ready-header provider contract, use
+//! [`azure_blob`]. This does not change the JSON REST dialect or its option behavior.
 
 use delta_kernel::object_store::Error as ObjectStoreError;
 
 mod auth;
+pub mod azure_blob;
 mod client;
 mod config;
 mod response;
